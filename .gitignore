@@ -1,2 +1,4 @@
 .env
 __pycache__/
+raycast-extension/node_modules/
+raycast-extension/dist/
