@@ -12,8 +12,8 @@ import anthropic
 MODEL = "qwen3-coder-plus"
 BASE_URL = "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic"
 HOME = str(Path.home())
-MAX_CANDIDATES = 50
-MAX_READ_CANDIDATES = 30
+MAX_CANDIDATES = 30
+MAX_READ_CANDIDATES = 15
 MAX_CONTENT_BYTES = 10240
 MAX_FILE_SIZE = 5 * 1024 * 1024
 MDFIND_TIMEOUT = 5
@@ -82,9 +82,12 @@ def search_candidates(analysis: dict) -> list[str]:
     seen = set()
     results = []
 
+    skip_dirs = {"/Library/", "/Caches/", "/logs/", "/.Trash/", "/.cache/",
+                  "/node_modules/", "/.git/", "/CachedData/", "/CachedProfilesData/"}
+
     def add(paths: list[str]):
         for p in paths:
-            if p not in seen and os.path.exists(p):
+            if p not in seen and os.path.exists(p) and not any(s in p for s in skip_dirs):
                 seen.add(p)
                 results.append(p)
 
@@ -199,7 +202,7 @@ def build_candidates_info(paths: list[str]) -> list[dict]:
             "size": _format_size(stat.st_size),
         }
         if content:
-            info["content_preview"] = content[:2000]
+            info["content_preview"] = content[:500]
         candidates.append(info)
     return candidates
 
@@ -336,11 +339,16 @@ def main():
         print("Error: DASHSCOPE_API_KEY environment variable not set.", file=sys.stderr)
         sys.exit(1)
 
+    import time
+    t0 = time.time()
+
     client = anthropic.Anthropic(api_key=api_key, base_url=BASE_URL)
 
     # Step 1: Analyse query
     print(f'Searching for: "{user_query}"')
+    t1 = time.time()
     analysis = analyse_query(client, user_query)
+    print(f"  [analyse: {time.time()-t1:.1f}s]", file=sys.stderr)
 
     keywords_display = " | ".join(
         " ".join(ks) for ks in analysis.get("keyword_sets", [])
@@ -351,7 +359,9 @@ def main():
     print(f"Keywords: {keywords_display}")
 
     # Step 2: Multi-pass mdfind
+    t2 = time.time()
     paths = search_candidates(analysis)
+    print(f"  [mdfind: {time.time()-t2:.1f}s]", file=sys.stderr)
     if not paths:
         print("\nNo files found. Try different search terms.")
         sys.exit(0)
@@ -359,14 +369,19 @@ def main():
     print(f"Found {len(paths)} candidates, reading content...")
 
     # Step 3: Read candidates
+    t3 = time.time()
     candidates = build_candidates_info(paths)
+    print(f"  [read files: {time.time()-t3:.1f}s]", file=sys.stderr)
     if not candidates:
         print("\nCouldn't read any candidate files.")
         sys.exit(0)
 
     # Step 4: Rank with LLM
     context_summary = analysis.get("context_summary", user_query)
+    t4 = time.time()
     rankings = rank_candidates(client, user_query, context_summary, candidates)
+    print(f"  [rank: {time.time()-t4:.1f}s]", file=sys.stderr)
+    print(f"  [total: {time.time()-t0:.1f}s]", file=sys.stderr)
 
     # Step 5: Build results
     results = []
