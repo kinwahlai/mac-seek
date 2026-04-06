@@ -255,11 +255,12 @@ Consider:
 
 Return JSON only:
 [
-  {{"rank": 1, "index": 0, "reason": "One-line explanation"}},
+  {{"rank": 1, "index": 0, "confidence": 95, "reason": "One-line explanation"}},
   ...
 ]
 
-If fewer than 5 candidates seem relevant, return only the relevant ones.
+- confidence: 0-100 how confident this is the file the user wants. 90+ = almost certain, 70-89 = likely, 50-69 = possible, below 50 = weak match.
+- If fewer than 5 candidates seem relevant, return only the relevant ones. Omit weak matches (confidence < 30).
 
 Candidates:
 {candidates_json}'''
@@ -422,6 +423,7 @@ def main():
             "filename": c["filename"],
             "modified": c["modified"],
             "size": c["size"],
+            "confidence": r.get("confidence", 0),
             "reason": r["reason"],
         })
 
@@ -440,8 +442,10 @@ def main():
         sys.exit(0)
 
     for r in results:
+        conf = r["confidence"]
+        bar = "█" * (conf // 10) + "░" * (10 - conf // 10)
         print(f"  {r['rank']}. {r['path']}")
-        print(f"     Modified: {r['modified']}  |  Size: {r['size']}")
+        print(f"     Modified: {r['modified']}  |  Size: {r['size']}  |  Confidence: {bar} {conf}%")
         print(f"     → {r['reason']}")
         print()
 
