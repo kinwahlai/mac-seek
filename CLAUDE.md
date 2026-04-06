@@ -19,10 +19,14 @@ Single-file Python CLI (`seek.py`) with this pipeline:
 ## File Structure
 
 ```
-seek.py              # Main CLI — single-file, all logic here
-raycast/seek.sh      # Raycast script command wrapper (alias: sk)
-.env                 # DASHSCOPE_API_KEY (gitignored)
-semantic-file-search-spec.md  # Original project spec
+seek.py                        # Main CLI — single-file, all logic here
+raycast/seek.sh                # Raycast script command wrapper (alias: sk)
+raycast-extension/             # Raycast extension (TypeScript/React)
+  src/seek.tsx                 # Extension source — List with detail panel
+  package.json                 # Extension manifest and dependencies
+  assets/command-icon.png      # Extension icon
+.env                           # DASHSCOPE_API_KEY (gitignored)
+semantic-file-search-spec.md   # Original project spec
 ```
 
 ## Commands
@@ -31,13 +35,17 @@ semantic-file-search-spec.md  # Original project spec
 # Run from project dir
 python seek.py "your natural language query"
 
-# JSON output (for programmatic use / future Raycast extension)
+# JSON output (used by Raycast extension)
 python seek.py --json "your query"
 
 # If installed to PATH (~/.local/bin/seek):
 seek "your natural language query"
 
-# Raycast: type "sk" → Tab → type query → Enter
+# Raycast extension: build production
+cd raycast-extension && npm run build
+
+# Raycast extension: development mode
+cd raycast-extension && npm run dev
 ```
 
 ## Dependencies
@@ -45,6 +53,9 @@ seek "your natural language query"
 ```bash
 pip install anthropic        # Required — used as SDK even with DashScope endpoint
 brew install poppler pandoc  # Optional — for PDF/docx content extraction
+
+# Raycast extension
+cd raycast-extension && npm install
 ```
 
 ## Key Technical Decisions
@@ -55,19 +66,29 @@ brew install poppler pandoc  # Optional — for PDF/docx content extraction
 - **Path filtering**: Extensive skip patterns exclude macOS system dirs, caches, build artifacts, package managers, IDE files, and Python/Node/Rust caches to keep candidates relevant
 - **mdfind scoped to `~`** to avoid system files; each pass has 5-second timeout; all passes run in parallel
 - **Graceful degradation**: pdftotext/pandoc are optional; warns once if missing, falls back to filename/metadata matching
-- **Non-interactive mode**: skips the "Open file" prompt when stdin is not a TTY (e.g. Raycast)
-- **`--json` flag**: outputs ranked results as JSON array for programmatic consumers (reserved for future Raycast extension)
+- **`--json` flag**: outputs clean JSON to stdout, all status lines to stderr. Used by the Raycast extension
 - **Python path**: hardcoded to `/opt/homebrew/anaconda3/bin/python3` where `anthropic` SDK is installed
 - **Installation**: symlinked to `~/.local/bin/seek`
 - **Timing diagnostics**: printed to stderr for performance monitoring
 
 ## Raycast Integration
 
-Script command at `raycast/seek.sh` — uses human-readable output (fullOutput mode), not `--json`. Add the `raycast/` directory as a Script Commands directory in Raycast settings. Set alias to `sk` for quick access.
+Two options available:
+
+### Script Command (simple)
+`raycast/seek.sh` — text output in fullOutput mode. Add the `raycast/` directory as a Script Commands directory in Raycast settings. Set alias to `sk`.
+
+### Extension (interactive)
+`raycast-extension/` — TypeScript/React extension with:
+- In-view search bar with 1.5s debounce (prevents cancellation during ~10s search)
+- Interactive list with confidence-colored icons and % tags
+- Detail panel showing LLM reasoning, full path, and metadata
+- Actions: Open File, Show in Finder, Copy Path, Open in VS Code
+- `npm run dev` to register in Raycast Development section
+- `npm run build` for production build
 
 ## Future Enhancements
 
-- Build a proper Raycast extension (TypeScript/React) with interactive list UI — select a result and press Enter to open the file. Use `--json` output for structured data
 - Cache recent searches in SQLite for instant re-retrieval
 - `seek --last` to re-show previous results
 - Index file contents locally with embeddings for faster repeat searches
