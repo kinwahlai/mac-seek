@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import anthropic
@@ -82,29 +83,49 @@ def search_candidates(analysis: dict) -> list[str]:
     seen = set()
     results = []
 
-    skip_dirs = {"/Library/", "/Caches/", "/logs/", "/.Trash/", "/.cache/",
-                  "/node_modules/", "/.git/", "/CachedData/", "/CachedProfilesData/"}
+    skip_patterns = {
+        # macOS system
+        "/Library/", "/.Trash/", "/.Spotlight-V100/", "/.fseventsd/",
+        "/Photos Library.photoslibrary/",
+        # Caches & logs
+        "/Caches/", "/cache/", "/.cache/", "/logs/", "/CachedData/",
+        "/CachedProfilesData/", "/CachedExtensions/",
+        # Version control
+        "/.git/", "/.svn/", "/.hg/",
+        # Python
+        "/__pycache__/", "/.venv/", "/venv/", "/site-packages/",
+        "/.eggs/", "/.tox/", "/.mypy_cache/", "/.pytest_cache/",
+        # Node/JS
+        "/node_modules/", "/.next/", "/dist/", "/.nuxt/",
+        "/bower_components/",
+        # Build artifacts
+        "/build/", "/.build/", "/DerivedData/",
+        # IDE & editor
+        "/.idea/", "/.vscode/", "/.eclipse/",
+        # Package managers
+        "/.npm/", "/.yarn/", "/.pnpm/", "/.cargo/", "/.rustup/",
+        "/.gradle/", "/.m2/", "/.pub-cache/", "/Pods/",
+        # Other
+        "/.docker/", "/tmp/", "/.local/share/",
+    }
 
     def add(paths: list[str]):
         for p in paths:
-            if p not in seen and os.path.exists(p) and not any(s in p for s in skip_dirs):
+            if (p not in seen
+                and not any(s in p for s in skip_patterns)
+                and os.path.isfile(p)):
                 seen.add(p)
                 results.append(p)
 
     keyword_sets = analysis.get("keyword_sets", [])
 
-    # Pass 1-2: keyword sets
+    # Build all mdfind queries upfront
+    queries = []
     for kw_set in keyword_sets:
-        query = " ".join(kw_set)
-        add(run_mdfind(query))
-        if len(results) >= MAX_CANDIDATES:
-            break
-
-    # Pass 3: filename search
+        queries.append(" ".join(kw_set))
     for frag in analysis.get("filename_fragments", []):
-        add(run_mdfind(f"kMDItemDisplayName == '*{frag}*'cd"))
+        queries.append(f"kMDItemDisplayName == '*{frag}*'cd")
 
-    # Pass 4: date-scoped search
     date_hint = analysis.get("date_hint")
     if date_hint and keyword_sets:
         main_keyword = keyword_sets[0][0] if keyword_sets[0] else None
@@ -120,12 +141,17 @@ def search_candidates(analysis: dict) -> list[str]:
             else:  # YYYY
                 start_date = f"{date_hint}-01-01"
                 end_date = f"{int(date_hint) + 1}-01-01"
-            date_query = (
+            queries.append(
                 f"{main_keyword} && "
                 f"kMDItemContentModificationDate >= $time.iso({start_date}) && "
                 f"kMDItemContentModificationDate < $time.iso({end_date})"
             )
-            add(run_mdfind(date_query))
+
+    # Run all mdfind passes in parallel
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        futures = [pool.submit(run_mdfind, q) for q in queries]
+        for f in futures:
+            add(f.result())
 
     # Sort by modification date (most recent first) and cap
     results.sort(key=lambda p: os.path.getmtime(p), reverse=True)
