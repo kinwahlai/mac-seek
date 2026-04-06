@@ -17,4 +17,4 @@
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 export DASHSCOPE_API_KEY="$(grep DASHSCOPE_API_KEY "$HOME/dev_repo/AI-projects/mac-seek/.env" | cut -d= -f2)"
 
-python3 "$HOME/dev_repo/AI-projects/mac-seek/seek.py" "$1"
+/opt/homebrew/anaconda3/bin/python3 "$HOME/dev_repo/AI-projects/mac-seek/seek.py" "$1"

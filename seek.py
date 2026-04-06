@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/anaconda3/bin/python3
 """Semantic file search for macOS — find files by natural language description."""
 
 import json
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import anthropic
 
-MODEL = "qwen3.5-plus"
+MODEL = "qwen3-coder-plus"
 BASE_URL = "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic"
 HOME = str(Path.home())
 MAX_CANDIDATES = 50
