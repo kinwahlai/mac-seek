@@ -369,10 +369,13 @@ def main():
     import time
     t0 = time.time()
 
+    # In JSON mode, all status output goes to stderr to keep stdout clean
+    log = (lambda msg: print(msg, file=sys.stderr)) if json_mode else print
+
     client = anthropic.Anthropic(api_key=api_key, base_url=BASE_URL)
 
     # Step 1: Analyse query
-    print(f'Searching for: "{user_query}"')
+    log(f'Searching for: "{user_query}"')
     t1 = time.time()
     analysis = analyse_query(client, user_query)
     print(f"  [analyse: {time.time()-t1:.1f}s]", file=sys.stderr)
@@ -383,17 +386,17 @@ def main():
     filenames = analysis.get("filename_fragments", [])
     if filenames:
         keywords_display += " | filename:" + ",".join(filenames)
-    print(f"Keywords: {keywords_display}")
+    log(f"Keywords: {keywords_display}")
 
     # Step 2: Multi-pass mdfind
     t2 = time.time()
     paths = search_candidates(analysis)
     print(f"  [mdfind: {time.time()-t2:.1f}s]", file=sys.stderr)
     if not paths:
-        print("\nNo files found. Try different search terms.")
+        log("\nNo files found. Try different search terms.")
         sys.exit(0)
 
-    print(f"Found {len(paths)} candidates, reading content...")
+    log(f"Found {len(paths)} candidates, reading content...")
 
     # Step 3: Read candidates
     t3 = time.time()

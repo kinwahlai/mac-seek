@@ -13,15 +13,7 @@
       "name": "seek",
       "title": "Seek Files",
       "description": "Find files by describing what you remember",
-      "mode": "view",
-      "arguments": [
-        {
-          "name": "query",
-          "placeholder": "describe the file...",
-          "type": "text",
-          "required": false
-        }
-      ]
+      "mode": "view"
     }
   ],
   "dependencies": {
