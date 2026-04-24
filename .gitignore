@@ -1,4 +1,5 @@
 .env
+.venv/
 tools/caption/seek-caption
 tools/caption/*.o
 __pycache__/

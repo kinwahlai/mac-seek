@@ -15,35 +15,37 @@ seek "the image with hold and let go written on it"
 
 ## Quick start
 
-### 1. Install Python dependencies
-
-```bash
-pip install openai
-# Optional — enables PDF and Word doc content reading:
-brew install poppler pandoc
-```
-
-### 2. Build the image caption helper
-
-```bash
-cd tools/caption
-swiftc -O seek-caption.swift -o seek-caption
-```
-
-This compiles a small Swift binary that uses Apple's Vision framework (on-device OCR + image classification). Requires macOS CLI tools (`xcode-select --install`).
-
-### 3. Get an OpenRouter API key
+### 1. Get an OpenRouter API key
 
 [openrouter.ai/keys](https://openrouter.ai/keys) — free account, no credit card required for free-tier models.
 
-### 4. Configure
+### 2. Install
 
-Create `~/.config/seek/config.toml` (or let `seek index` create it on first run):
+```bash
+make install
+```
+
+This creates a Python venv, installs dependencies, builds the image caption helper (requires macOS CLI tools — run `xcode-select --install` first if prompted), and puts `seek` on your PATH at `~/.local/bin/seek`.
+
+Optional — enables PDF and Word doc content reading:
+```bash
+brew install poppler pandoc
+```
+
+### 3. Configure
+
+Add your API key to `~/.config/seek/config.toml` (created automatically on first run):
 
 ```toml
 [llm]
-api_key_env = "OPENROUTER_API_KEY"   # name of env var to read the key from
-api_key = "sk-or-..."                # OR paste key directly here
+api_key = "sk-or-..."   # paste your OpenRouter key here
+```
+
+Full config reference:
+
+```toml
+[llm]
+api_key = "sk-or-..."
 base_url = "https://openrouter.ai/api/v1"
 model = "google/gemini-2.0-flash-lite-001"
 fallback_models = [
@@ -53,31 +55,19 @@ fallback_models = [
 ]
 
 [index]
-folders = [
-  "~/Downloads",
-  "~/Desktop",
-]
+folders = ["~/Downloads", "~/Desktop"]
 extensions = ["jpg", "jpeg", "png", "heic", "gif", "webp", "tiff"]
 max_image_bytes = 20_000_000
 ```
 
-If you prefer env vars, set `OPENROUTER_API_KEY` in your shell profile or `.env` file instead of using `api_key` directly.
-
-### 5. Install to PATH
-
-```bash
-ln -sf "$(pwd)/seek.py" ~/.local/bin/seek
-chmod +x seek.py
-```
-
-### 6. Index your images (optional)
+### 4. Index your images (optional)
 
 ```bash
 seek index          # caption images in configured folders
 seek index --status # show index stats
 ```
 
-### 7. Search
+### 5. Search
 
 ```bash
 seek "the slide deck from the product review"
