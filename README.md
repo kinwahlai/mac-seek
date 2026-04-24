@@ -116,6 +116,36 @@ api_key = "your-key"
 
 ---
 
+## Local inference (MLX, Apple Silicon)
+
+Run inference fully on-device — no API key, no network, no per-search cost:
+
+```bash
+make install-mlx    # adds mlx-lm to the existing venv
+```
+
+Then edit `~/.config/seek/config.toml`:
+
+```toml
+[llm]
+provider = "mlx"
+model = "mlx-community/Qwen2.5-3B-Instruct-4bit"
+```
+
+The model (~2GB) is downloaded from HuggingFace on first use into `~/.cache/huggingface/hub/`. Subsequent runs load from disk.
+
+**Recommended models** (4-bit quantized, comfortable on 16GB Macs):
+
+| Model | Size | Notes |
+|---|---|---|
+| `mlx-community/Qwen2.5-3B-Instruct-4bit` | ~2GB | Best JSON reliability for size |
+| `mlx-community/Llama-3.2-3B-Instruct-4bit` | ~2GB | Meta's small instruct model |
+| `mlx-community/Qwen2.5-7B-Instruct-4bit` | ~5GB | Better quality, slower load |
+
+To switch back to OpenRouter, remove the `provider` and `model` lines (or comment them out).
+
+---
+
 ## Image search
 
 `seek` indexes images using Apple Vision (on-device OCR + scene classification — no image data leaves your machine). The index lives at `~/.local/share/seek/index.db`.

@@ -37,6 +37,10 @@ fallback_models = [
   "nvidia/nemotron-3-super-120b-a12b:free",
 ]
 
+# To use local MLX inference instead (Apple Silicon only, requires `make install-mlx`):
+# provider = "mlx"
+# model = "mlx-community/Qwen2.5-3B-Instruct-4bit"
+
 [index]
 folders = [
   "~/Downloads",
@@ -140,11 +144,77 @@ def _get_db() -> sqlite3.Connection | None:
 
 # ── LLM call with fallback ───────────────────────────────────────────────────
 
-def _llm_call(client: OpenAI, model: str, fallback_models: list[str], max_tokens: int, messages: list[dict]) -> str:
+def _extract_json(text: str) -> str:
+    """Extract the first JSON object or array from text, stripping prose and fences."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[: text.rfind("```")]
+        text = text.strip()
+    # Try whichever delimiter appears first in the text
+    brace = text.find("{")
+    bracket = text.find("[")
+    if brace == -1 and bracket == -1:
+        return text
+    if brace == -1 or (bracket != -1 and bracket < brace):
+        pairs = [("[", "]"), ("{", "}")]
+    else:
+        pairs = [("{", "}"), ("[", "]")]
+    for open_ch, close_ch in pairs:
+        start = text.find(open_ch)
+        if start == -1:
+            continue
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == open_ch:
+                depth += 1
+            elif text[i] == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+    return text
+
+
+_mlx_cache: dict[str, tuple] = {}
+
+
+def _mlx_load(model_id: str) -> tuple:
+    if model_id not in _mlx_cache:
+        try:
+            from mlx_lm import load  # type: ignore
+        except ImportError:
+            print("Error: mlx-lm not installed. Run: make install-mlx", file=sys.stderr)
+            sys.exit(1)
+        print(f"  [loading mlx model {model_id}...]", file=sys.stderr)
+        _mlx_cache[model_id] = load(model_id)
+    return _mlx_cache[model_id]
+
+
+def _mlx_call(model_id: str, max_tokens: int, messages: list[dict]) -> str:
+    from mlx_lm import generate  # type: ignore
+    model, tokenizer = _mlx_load(model_id)
+    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    return generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False).strip()
+
+
+def _llm_call(
+    provider: str,
+    client: "OpenAI | None",
+    model: str,
+    fallback_models: list[str],
+    max_tokens: int,
+    messages: list[dict],
+) -> str:
+    if provider == "mlx":
+        try:
+            return _mlx_call(model, max_tokens, messages)
+        except Exception as e:
+            raise RuntimeError(f"MLX inference failed: {e}") from e
     last_err: Exception | None = None
     for m in [model] + fallback_models:
         try:
-            resp = client.chat.completions.create(model=m, max_tokens=max_tokens, messages=messages)
+            resp = client.chat.completions.create(model=m, max_tokens=max_tokens, messages=messages)  # type: ignore
             return resp.choices[0].message.content.strip()
         except Exception as e:
             last_err = e
@@ -154,7 +224,7 @@ def _llm_call(client: OpenAI, model: str, fallback_models: list[str], max_tokens
 
 # ── Query analysis ──────────────────────────────────────────────────────────
 
-def analyse_query(client: OpenAI, model: str, fallback_models: list[str], user_query: str) -> dict:
+def analyse_query(provider: str, client: "OpenAI | None", model: str, fallback_models: list[str], user_query: str) -> dict:
     prompt = f'''Analyse this file search query. The user is trying to find a file on their Mac.
 
 Query: "{user_query}"
@@ -179,13 +249,8 @@ Rules:
 - file_type_hint: infer from context. "notes I took" → document. "that script" → code. null if unclear.
 - context_summary: preserve the user's situational context — "notes taken during an info session", "a playbook prepared for someone", etc. This helps with ranking.'''
 
-    text = _llm_call(client, model, fallback_models, 1024, [{"role": "user", "content": prompt}])
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        if text.endswith("```"):
-            text = text[: text.rfind("```")]
-        text = text.strip()
-    return json.loads(text)
+    text = _llm_call(provider, client, model, fallback_models, 1024, [{"role": "user", "content": prompt}])
+    return json.loads(_extract_json(text))
 
 
 # ── File discovery ──────────────────────────────────────────────────────────
@@ -378,7 +443,8 @@ def build_candidates_info(paths: list[str], db: sqlite3.Connection | None = None
 # ── LLM ranking ─────────────────────────────────────────────────────────────
 
 def rank_candidates(
-    client: OpenAI,
+    provider: str,
+    client: "OpenAI | None",
     model: str,
     fallback_models: list[str],
     user_query: str,
@@ -412,13 +478,8 @@ Return JSON only:
 Candidates:
 {candidates_json}'''
 
-    text = _llm_call(client, model, fallback_models, 1024, [{"role": "user", "content": prompt}])
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        if text.endswith("```"):
-            text = text[: text.rfind("```")]
-        text = text.strip()
-    return json.loads(text)
+    text = _llm_call(provider, client, model, fallback_models, 1024, [{"role": "user", "content": prompt}])
+    return json.loads(_extract_json(text))
 
 
 # ── Formatting helpers ───────────────────────────────────────────────────────
@@ -447,24 +508,24 @@ def _load_config() -> dict:
         return tomllib.load(f)
 
 
-def _load_llm_config() -> tuple[str, str, str, list[str]]:
-    """Return (api_key, base_url, model, fallback_models). Env vars override config, config overrides defaults."""
+def _load_llm_config() -> tuple[str, str, str, str, list[str]]:
+    """Return (provider, api_key, base_url, model, fallback_models). Env vars override config, config overrides defaults."""
     config = _load_config()
     llm = config.get("llm", {})
+    provider = llm.get("provider", "openai")
     model = os.environ.get("SEEK_LLM_MODEL", llm.get("model", "google/gemini-2.0-flash-exp:free"))
     base_url = os.environ.get("SEEK_LLM_BASE_URL", llm.get("base_url", "https://openrouter.ai/api/v1"))
     api_key_env = os.environ.get("SEEK_LLM_API_KEY_ENV", llm.get("api_key_env", "OPENROUTER_API_KEY"))
-    # Support key stored directly in config via `api_key` field, or via env var lookup
     api_key = os.environ.get(api_key_env) or llm.get("api_key")
     fallback_models = llm.get("fallback_models", ["meta-llama/llama-3.3-70b-instruct:free"])
-    if not api_key:
+    if provider != "mlx" and not api_key:
         print(
             f"Error: {api_key_env} environment variable not set.\n"
             f"  Get a free key at https://openrouter.ai/keys",
             file=sys.stderr,
         )
         sys.exit(1)
-    return api_key, base_url, model, fallback_models
+    return provider, api_key, base_url, model, fallback_models
 
 
 def _load_search_config() -> tuple[int, int, int]:
@@ -634,18 +695,18 @@ def main():
 
     user_query = " ".join(args)
 
-    api_key, base_url, model, fallback_models = _load_llm_config()
+    provider, api_key, base_url, model, fallback_models = _load_llm_config()
     max_candidates, max_read_candidates, top_results = _load_search_config()
 
     t0 = time.time()
     log = (lambda msg: print(msg, file=sys.stderr)) if json_mode else print
 
     db = _get_db()
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    client = None if provider == "mlx" else OpenAI(api_key=api_key, base_url=base_url)
 
     log(f'Searching for: "{user_query}"')
     t1 = time.time()
-    analysis = analyse_query(client, model, fallback_models, user_query)
+    analysis = analyse_query(provider, client, model, fallback_models, user_query)
     print(f"  [analyse: {time.time()-t1:.1f}s]", file=sys.stderr)
 
     keywords_display = " | ".join(
@@ -678,7 +739,7 @@ def main():
 
     context_summary = analysis.get("context_summary", user_query)
     t4 = time.time()
-    rankings = rank_candidates(client, model, fallback_models, user_query, context_summary, candidates, top_results)
+    rankings = rank_candidates(provider, client, model, fallback_models, user_query, context_summary, candidates, top_results)
     print(f"  [rank: {time.time()-t4:.1f}s]", file=sys.stderr)
     print(f"  [total: {time.time()-t0:.1f}s]", file=sys.stderr)
 

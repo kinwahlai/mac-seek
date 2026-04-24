@@ -10,11 +10,12 @@ VENV_PY  := $(VENV_DIR)/bin/python3
 help:
 	@echo "seek — semantic file search for macOS"
 	@echo ""
-	@echo "  make install    Install everything: venv + pip deps + Swift binary + seek command"
-	@echo "  make deps       Create venv and install Python dependencies only"
-	@echo "  make build      Build the seek-caption Swift binary only"
-	@echo "  make uninstall  Remove the seek command from $(BIN_DIR)"
-	@echo "  make clean      Remove venv and compiled Swift binary"
+	@echo "  make install      Install everything: venv + pip deps + Swift binary + seek command"
+	@echo "  make install-mlx  Add local MLX inference support (Apple Silicon only)"
+	@echo "  make deps         Create venv and install Python dependencies only"
+	@echo "  make build        Build the seek-caption Swift binary only"
+	@echo "  make uninstall    Remove the seek command from $(BIN_DIR)"
+	@echo "  make clean        Remove venv and compiled Swift binary"
 	@echo ""
 	@echo "  Override Python: make install PYTHON=/path/to/python3"
 
@@ -48,6 +49,11 @@ install: deps build
 	@echo ""
 	@echo "  Then: seek \"describe the file you're looking for\""
 
+install-mlx: deps
+	@echo "  Installing mlx-lm..."
+	@$(VENV_PY) -m pip install --quiet mlx-lm
+	@echo "  Done. Set provider = \"mlx\" in ~/.config/seek/config.toml to use local inference."
+
 uninstall:
 	rm -f $(SEEK_BIN)
 	@echo "  Removed $(SEEK_BIN)"
@@ -57,4 +63,4 @@ clean:
 	rm -f tools/caption/seek-caption tools/caption/*.o
 	@echo "  Cleaned"
 
-.PHONY: help deps build install uninstall clean
+.PHONY: help deps build install install-mlx uninstall clean
