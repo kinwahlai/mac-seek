@@ -132,7 +132,7 @@ provider = "mlx"
 model = "mlx-community/Qwen3-1.7B-4bit"
 ```
 
-The model (~1.1GB) is downloaded from HuggingFace on first use into `~/.cache/huggingface/hub/`. Subsequent runs load from disk. Thinking mode is automatically disabled for fast, direct JSON output.
+The model (~1.1GB) is downloaded during `make install-mlx` into `~/.cache/huggingface/hub/`. To use a different model: `make install-mlx MLX_MODEL=mlx-community/Qwen3-4B-4bit`. Thinking mode is automatically disabled for fast, direct JSON output.
 
 **Recommended models** (4-bit quantized, comfortable on 16GB Macs):
 
