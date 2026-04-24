@@ -1,3 +1,7 @@
 .env
 tools/caption/seek-caption
 tools/caption/*.o
+__pycache__/
+.claude/
+raycast-extension/node_modules/
+raycast-extension/raycast-env.d.ts
