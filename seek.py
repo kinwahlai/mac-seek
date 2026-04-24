@@ -232,17 +232,15 @@ def search_candidates(analysis: dict, db: sqlite3.Connection | None = None) -> l
 
     # Image index hits first — so they're guaranteed a slot at the front of the read window
     if db is not None:
-        search_text = analysis.get("context_summary", "")
-        if not search_text:
-            search_text = " ".join(" ".join(ks) for ks in keyword_sets)
-        if search_text:
+        # Use keyword_sets (concise, LLM-extracted) rather than verbose context_summary
+        fts_terms = list(dict.fromkeys(
+            w for ks in keyword_sets for w in ks if len(w) >= 2
+        ))
+        if fts_terms:
             try:
-                # FTS5 uses AND by default; join with OR so partial matches surface
-                fts_query = " OR ".join(
-                    w for w in search_text.replace('"', "").split() if len(w) > 2
-                )
+                fts_query = " OR ".join(fts_terms)
                 rows = db.execute(
-                    "SELECT path FROM images_fts WHERE images_fts MATCH ? ORDER BY rank LIMIT 10",
+                    "SELECT path FROM images_fts WHERE images_fts MATCH ? ORDER BY rank LIMIT 15",
                     (fts_query,),
                 ).fetchall()
                 add_image([row[0] for row in rows])
