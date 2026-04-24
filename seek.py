@@ -268,9 +268,9 @@ def search_candidates(analysis: dict, db: sqlite3.Connection | None = None) -> l
         for f in futures:
             add_mdfind(f.result())
 
-    # Sort mdfind results by recency; image hits stay at front (already ranked by FTS)
-    mdfind_results.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    combined = image_hits + mdfind_results
+    # Merge all sources and sort by recency so images don't crowd out text/PDFs
+    combined = list(dict.fromkeys(image_hits + mdfind_results))
+    combined.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return combined[:MAX_CANDIDATES]
 
 
