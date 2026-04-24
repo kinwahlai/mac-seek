@@ -11,10 +11,7 @@ import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import anthropic
-
-MODEL = "qwen3-coder-plus"
-BASE_URL = "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic"
+from openai import OpenAI
 HOME = str(Path.home())
 MAX_CANDIDATES = 30
 MAX_READ_CANDIDATES = 15
@@ -29,6 +26,16 @@ CAPTION_BINARY = Path(__file__).resolve().parent / "tools/caption/seek-caption"
 CAPTION_BATCH = 20
 
 DEFAULT_CONFIG = """\
+[llm]
+api_key_env = "OPENROUTER_API_KEY"
+base_url = "https://openrouter.ai/api/v1"
+model = "google/gemini-2.0-flash-lite-001"
+fallback_models = [
+  "tencent/hy3-preview:free",
+  "openrouter/free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+]
+
 [index]
 folders = [
   "~/Downloads",
@@ -125,9 +132,23 @@ def _get_db() -> sqlite3.Connection | None:
         return None
 
 
+# ── LLM call with fallback ───────────────────────────────────────────────────
+
+def _llm_call(client: OpenAI, model: str, fallback_models: list[str], max_tokens: int, messages: list[dict]) -> str:
+    last_err: Exception | None = None
+    for m in [model] + fallback_models:
+        try:
+            resp = client.chat.completions.create(model=m, max_tokens=max_tokens, messages=messages)
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            last_err = e
+            print(f"  [model {m} failed ({type(e).__name__}), trying fallback]", file=sys.stderr)
+    raise last_err
+
+
 # ── Query analysis ──────────────────────────────────────────────────────────
 
-def analyse_query(client: anthropic.Anthropic, user_query: str) -> dict:
+def analyse_query(client: OpenAI, model: str, fallback_models: list[str], user_query: str) -> dict:
     prompt = f'''Analyse this file search query. The user is trying to find a file on their Mac.
 
 Query: "{user_query}"
@@ -152,12 +173,7 @@ Rules:
 - file_type_hint: infer from context. "notes I took" → document. "that script" → code. null if unclear.
 - context_summary: preserve the user's situational context — "notes taken during an info session", "a playbook prepared for someone", etc. This helps with ranking.'''
 
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=512,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = next(b.text for b in resp.content if b.type == "text").strip()
+    text = _llm_call(client, model, fallback_models, 1024, [{"role": "user", "content": prompt}])
     if text.startswith("```"):
         text = text.split("\n", 1)[1]
         if text.endswith("```"):
@@ -356,7 +372,9 @@ def build_candidates_info(paths: list[str], db: sqlite3.Connection | None = None
 # ── LLM ranking ─────────────────────────────────────────────────────────────
 
 def rank_candidates(
-    client: anthropic.Anthropic,
+    client: OpenAI,
+    model: str,
+    fallback_models: list[str],
     user_query: str,
     context_summary: str,
     candidates: list[dict],
@@ -387,12 +405,7 @@ Return JSON only:
 Candidates:
 {candidates_json}'''
 
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = next(b.text for b in resp.content if b.type == "text").strip()
+    text = _llm_call(client, model, fallback_models, 1024, [{"role": "user", "content": prompt}])
     if text.startswith("```"):
         text = text.split("\n", 1)[1]
         if text.endswith("```"):
@@ -425,6 +438,26 @@ def _load_config() -> dict:
         print(f"  Created config: {CONFIG_FILE}", file=sys.stderr)
     with open(CONFIG_FILE, "rb") as f:
         return tomllib.load(f)
+
+
+def _load_llm_config() -> tuple[str, str, str, list[str]]:
+    """Return (api_key, base_url, model, fallback_models). Env vars override config, config overrides defaults."""
+    config = _load_config()
+    llm = config.get("llm", {})
+    model = os.environ.get("SEEK_LLM_MODEL", llm.get("model", "google/gemini-2.0-flash-exp:free"))
+    base_url = os.environ.get("SEEK_LLM_BASE_URL", llm.get("base_url", "https://openrouter.ai/api/v1"))
+    api_key_env = os.environ.get("SEEK_LLM_API_KEY_ENV", llm.get("api_key_env", "OPENROUTER_API_KEY"))
+    # Support key stored directly in config via `api_key` field, or via env var lookup
+    api_key = os.environ.get(api_key_env) or llm.get("api_key")
+    fallback_models = llm.get("fallback_models", ["meta-llama/llama-3.3-70b-instruct:free"])
+    if not api_key:
+        print(
+            f"Error: {api_key_env} environment variable not set.\n"
+            f"  Get a free key at https://openrouter.ai/keys",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return api_key, base_url, model, fallback_models
 
 
 def _caption_batch(paths: list[str]) -> dict[str, str]:
@@ -584,20 +617,17 @@ def main():
 
     user_query = " ".join(args)
 
-    api_key = os.environ.get("DASHSCOPE_API_KEY")
-    if not api_key:
-        print("Error: DASHSCOPE_API_KEY environment variable not set.", file=sys.stderr)
-        sys.exit(1)
+    api_key, base_url, model, fallback_models = _load_llm_config()
 
     t0 = time.time()
     log = (lambda msg: print(msg, file=sys.stderr)) if json_mode else print
 
     db = _get_db()
-    client = anthropic.Anthropic(api_key=api_key, base_url=BASE_URL)
+    client = OpenAI(api_key=api_key, base_url=base_url)
 
     log(f'Searching for: "{user_query}"')
     t1 = time.time()
-    analysis = analyse_query(client, user_query)
+    analysis = analyse_query(client, model, fallback_models, user_query)
     print(f"  [analyse: {time.time()-t1:.1f}s]", file=sys.stderr)
 
     keywords_display = " | ".join(
@@ -630,7 +660,7 @@ def main():
 
     context_summary = analysis.get("context_summary", user_query)
     t4 = time.time()
-    rankings = rank_candidates(client, user_query, context_summary, candidates)
+    rankings = rank_candidates(client, model, fallback_models, user_query, context_summary, candidates)
     print(f"  [rank: {time.time()-t4:.1f}s]", file=sys.stderr)
     print(f"  [total: {time.time()-t0:.1f}s]", file=sys.stderr)
 

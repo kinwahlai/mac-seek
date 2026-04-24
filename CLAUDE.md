@@ -29,7 +29,7 @@ raycast-extension/             # Raycast extension (TypeScript/React)
   src/seek.tsx                 # Extension source — List with detail panel
   package.json                 # Extension manifest and dependencies
   assets/command-icon.png      # Extension icon
-.env                           # DASHSCOPE_API_KEY (gitignored)
+.env                           # OPENROUTER_API_KEY (gitignored)
 semantic-file-search-spec.md   # Original project spec
 ```
 
@@ -66,7 +66,7 @@ cd raycast-extension && npm run dev
 ## Dependencies
 
 ```bash
-pip install anthropic        # Required — used as SDK even with DashScope endpoint
+pip install openai           # Required — OpenAI-compatible SDK (used for OpenRouter)
 brew install poppler pandoc  # Optional — for PDF/docx content extraction
 
 # Build the caption helper (one-time, needs macOS CLI tools with Swift)
@@ -80,9 +80,13 @@ cd raycast-extension && npm install
 
 ## Key Technical Decisions
 
-- **LLM**: `qwen3-coder-plus` via Alibaba DashScope Anthropic-compatible endpoint (`anthropic` SDK with custom `base_url`). Chosen over `qwen3.5-plus` for speed (no thinking overhead, ~2s vs ~7s per call)
-- **API key**: `DASHSCOPE_API_KEY` environment variable (stored in `.env`, gitignored)
-- **ThinkingBlock handling**: Some DashScope models return ThinkingBlock before TextBlock — response parsing filters for `type == "text"` blocks
+- **LLM**: `google/gemini-2.0-flash-lite-001` via OpenRouter by default (`openai` SDK with custom `base_url`). Fast (~1s/call) and cheap. Get a key at https://openrouter.ai/keys
+- **API key**: `OPENROUTER_API_KEY` environment variable (stored in `.env`, gitignored)
+- **LLM config override** (highest → lowest priority):
+  1. Env vars: `SEEK_LLM_MODEL`, `SEEK_LLM_BASE_URL`, `SEEK_LLM_API_KEY_ENV`
+  2. `[llm]` section in `~/.config/seek/config.toml`
+  3. Built-in defaults (OpenRouter + Gemini Flash free)
+- **Switching providers**: Edit `~/.config/seek/config.toml` `[llm]` section — e.g. set `base_url = "https://api.openai.com/v1"`, `model = "gpt-4o-mini"`, `api_key_env = "OPENAI_API_KEY"` for OpenAI
 - **Path filtering**: Extensive `SKIP_PATTERNS` set (top-level constant, shared by both search and indexer) excludes macOS system dirs, caches, build artifacts, package managers, IDE files, and Python/Node/Rust caches to keep candidates relevant
 - **iCloud stubs**: Detected via `com.apple.fileprovider.fpfs#P` xattr; top candidates downloaded via `brctl download` in parallel before content reading, with 4s timeout per file
 - **Image index**: SQLite at `~/.local/share/seek/index.db` with FTS5 virtual table. Caption = OCR text (if any) + Vision classification labels. Run `seek index` to populate; incremental by default (mtime comparison). Config at `~/.config/seek/config.toml`.
@@ -90,7 +94,7 @@ cd raycast-extension && npm install
 - **mdfind scoped to `~`** to avoid system files; each pass has 5-second timeout; all passes run in parallel
 - **Graceful degradation**: pdftotext/pandoc are optional; warns once if missing, falls back to filename/metadata matching
 - **`--json` flag**: outputs clean JSON to stdout, all status lines to stderr. Used by the Raycast extension
-- **Python path**: hardcoded to `/opt/homebrew/anaconda3/bin/python3` where `anthropic` SDK is installed
+- **Python path**: hardcoded to `/opt/homebrew/anaconda3/bin/python3` where `openai` SDK is installed
 - **Installation**: symlinked to `~/.local/bin/seek`
 - **Timing diagnostics**: printed to stderr for performance monitoring
 
