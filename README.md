@@ -183,7 +183,7 @@ Files offloaded to iCloud (not yet downloaded locally) are automatically downloa
 - **VLM image captioning** — replace the Apple Vision Swift binary with a vision-language model (e.g. via `mlx-vlm`) for richer semantic captions ("a signed MOU between two parties" vs OCR text alone). Apple Vision is instant and great at OCR; a VLM would add scene understanding at the cost of slower batch indexing. Best explored as an optional `seek index --rich` mode or for targeted re-captioning.
 - **Cache recent searches** — SQLite cache for instant re-retrieval of recent queries (`seek --last`)
 - **Embeddings index** — local embeddings for file contents to speed up repeat searches without LLM calls
-- **Interactive refinement** — if top results aren't right, refine the query conversationally
+- **Interactive refinement** — if top results aren't right, type a follow-up ("no, it was a PDF" / "more recent than that") and seek reruns with the original query + correction fed back to the LLM. No new mdfind pass needed — candidates are already read. UI: a persistent input bar at the bottom (Claude Code-style) using `prompt_toolkit` or `curses`, with results scrolled above.
 
 ---
 
