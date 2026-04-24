@@ -13,8 +13,9 @@ from pathlib import Path
 
 from openai import OpenAI
 HOME = str(Path.home())
-MAX_CANDIDATES = 30
-MAX_READ_CANDIDATES = 15
+MAX_CANDIDATES = 30       # default, overridden by [search] config
+MAX_READ_CANDIDATES = 15  # default, overridden by [search] config
+MAX_TOP_RESULTS = 5       # default, overridden by [search] config
 MAX_CONTENT_BYTES = 10240
 MAX_FILE_SIZE = 5 * 1024 * 1024
 MDFIND_TIMEOUT = 5
@@ -43,6 +44,11 @@ folders = [
 ]
 extensions = ["jpg", "jpeg", "png", "heic", "gif", "webp", "tiff"]
 max_image_bytes = 20_000_000
+
+[search]
+max_candidates = 30      # total candidates collected from mdfind + image index
+max_read_candidates = 15 # how many files to read content for (most recent first)
+top_results = 5          # how many ranked results to return
 """
 
 SKIP_PATTERNS = {
@@ -195,7 +201,7 @@ def run_mdfind(query: str) -> list[str]:
         return []
 
 
-def search_candidates(analysis: dict, db: sqlite3.Connection | None = None) -> list[str]:
+def search_candidates(analysis: dict, db: sqlite3.Connection | None = None, max_candidates: int = MAX_CANDIDATES) -> list[str]:
     seen: set[str] = set()
     mdfind_results: list[str] = []
     image_hits: list[str] = []
@@ -271,7 +277,7 @@ def search_candidates(analysis: dict, db: sqlite3.Connection | None = None) -> l
     # Merge all sources and sort by recency so images don't crowd out text/PDFs
     combined = list(dict.fromkeys(image_hits + mdfind_results))
     combined.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return combined[:MAX_CANDIDATES]
+    return combined[:max_candidates]
 
 
 # ── Content reading ─────────────────────────────────────────────────────────
@@ -339,8 +345,8 @@ def _read_docx(path: str) -> str | None:
     return None
 
 
-def build_candidates_info(paths: list[str], db: sqlite3.Connection | None = None) -> list[dict]:
-    top = paths[:MAX_READ_CANDIDATES]
+def build_candidates_info(paths: list[str], db: sqlite3.Connection | None = None, max_read_candidates: int = MAX_READ_CANDIDATES) -> list[dict]:
+    top = paths[:max_read_candidates]
 
     # Trigger iCloud downloads in parallel before reading
     icloud_paths = [p for p in top if _is_icloud_stub(p)]
@@ -378,6 +384,7 @@ def rank_candidates(
     user_query: str,
     context_summary: str,
     candidates: list[dict],
+    top_results: int = MAX_TOP_RESULTS,
 ) -> list[dict]:
     candidates_json = json.dumps(candidates, indent=2, default=str)
     prompt = f'''The user is looking for a file on their Mac.
@@ -385,7 +392,7 @@ def rank_candidates(
 Their description: "{user_query}"
 Context: {context_summary}
 
-Below are candidate files found on their machine. Rank the top 5 by how likely each is to be the file the user is describing.
+Below are candidate files found on their machine. Rank the top {top_results} by how likely each is to be the file the user is describing.
 
 Consider:
 - Content match: does the file content match what the user describes?
@@ -400,7 +407,7 @@ Return JSON only:
 ]
 
 - confidence: 0-100 how confident this is the file the user wants. 90+ = almost certain, 70-89 = likely, 50-69 = possible, below 50 = weak match.
-- If fewer than 5 candidates seem relevant, return only the relevant ones. Omit weak matches (confidence < 30).
+- If fewer than {top_results} candidates seem relevant, return only the relevant ones. Omit weak matches (confidence < 30).
 
 Candidates:
 {candidates_json}'''
@@ -458,6 +465,16 @@ def _load_llm_config() -> tuple[str, str, str, list[str]]:
         )
         sys.exit(1)
     return api_key, base_url, model, fallback_models
+
+
+def _load_search_config() -> tuple[int, int, int]:
+    """Return (max_candidates, max_read_candidates, top_results)."""
+    s = _load_config().get("search", {})
+    return (
+        int(s.get("max_candidates", MAX_CANDIDATES)),
+        int(s.get("max_read_candidates", MAX_READ_CANDIDATES)),
+        int(s.get("top_results", MAX_TOP_RESULTS)),
+    )
 
 
 def _caption_batch(paths: list[str]) -> dict[str, str]:
@@ -618,6 +635,7 @@ def main():
     user_query = " ".join(args)
 
     api_key, base_url, model, fallback_models = _load_llm_config()
+    max_candidates, max_read_candidates, top_results = _load_search_config()
 
     t0 = time.time()
     log = (lambda msg: print(msg, file=sys.stderr)) if json_mode else print
@@ -639,7 +657,7 @@ def main():
     log(f"Keywords: {keywords_display}")
 
     t2 = time.time()
-    paths = search_candidates(analysis, db)
+    paths = search_candidates(analysis, db, max_candidates)
     print(f"  [mdfind+index: {time.time()-t2:.1f}s]", file=sys.stderr)
     if not paths:
         log("\nNo files found. Try different search terms.")
@@ -650,7 +668,7 @@ def main():
     log(f"Found {len(paths)} candidates, reading content...")
 
     t3 = time.time()
-    candidates = build_candidates_info(paths, db)
+    candidates = build_candidates_info(paths, db, max_read_candidates)
     print(f"  [read files: {time.time()-t3:.1f}s]", file=sys.stderr)
     if not candidates:
         print("\nCouldn't read any candidate files.")
@@ -660,7 +678,7 @@ def main():
 
     context_summary = analysis.get("context_summary", user_query)
     t4 = time.time()
-    rankings = rank_candidates(client, model, fallback_models, user_query, context_summary, candidates)
+    rankings = rank_candidates(client, model, fallback_models, user_query, context_summary, candidates, top_results)
     print(f"  [rank: {time.time()-t4:.1f}s]", file=sys.stderr)
     print(f"  [total: {time.time()-t0:.1f}s]", file=sys.stderr)
 

@@ -58,6 +58,11 @@ fallback_models = [
 folders = ["~/Downloads", "~/Desktop"]
 extensions = ["jpg", "jpeg", "png", "heic", "gif", "webp", "tiff"]
 max_image_bytes = 20_000_000
+
+[search]
+max_candidates = 30      # files collected from mdfind + image index
+max_read_candidates = 15 # how many to read content for (most recent first)
+top_results = 5          # how many ranked results to return
 ```
 
 ### 4. Index your images (optional)
