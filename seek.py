@@ -3,8 +3,11 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -19,6 +22,38 @@ MAX_CONTENT_BYTES = 10240
 MAX_FILE_SIZE = 5 * 1024 * 1024
 MDFIND_TIMEOUT = 5
 
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".gif", ".webp", ".tiff"}
+INDEX_DB = Path.home() / ".local/share/seek/index.db"
+CONFIG_FILE = Path.home() / ".config/seek/config.toml"
+CAPTION_BINARY = Path(__file__).resolve().parent / "tools/caption/seek-caption"
+CAPTION_BATCH = 20
+
+DEFAULT_CONFIG = """\
+[index]
+folders = [
+  "~/Downloads",
+  "~/Desktop",
+]
+extensions = ["jpg", "jpeg", "png", "heic", "gif", "webp", "tiff"]
+max_image_bytes = 20_000_000
+"""
+
+SKIP_PATTERNS = {
+    "/Library/", "/.Trash/", "/.Spotlight-V100/", "/.fseventsd/",
+    "/Photos Library.photoslibrary/",
+    "/Caches/", "/cache/", "/.cache/", "/logs/", "/CachedData/",
+    "/CachedProfilesData/", "/CachedExtensions/",
+    "/.git/", "/.svn/", "/.hg/",
+    "/__pycache__/", "/.venv/", "/venv/", "/site-packages/",
+    "/.eggs/", "/.tox/", "/.mypy_cache/", "/.pytest_cache/",
+    "/node_modules/", "/.next/", "/dist/", "/.nuxt/", "/bower_components/",
+    "/build/", "/.build/", "/DerivedData/",
+    "/.idea/", "/.vscode/", "/.eclipse/",
+    "/.npm/", "/.yarn/", "/.pnpm/", "/.cargo/", "/.rustup/",
+    "/.gradle/", "/.m2/", "/.pub-cache/", "/Pods/",
+    "/.docker/", "/tmp/", "/.local/share/",
+}
+
 _warned_tools = set()
 
 
@@ -27,6 +62,70 @@ def warn_tool_missing(tool: str, install_hint: str):
         print(f"  Note: {tool} not installed. Install with: {install_hint}", file=sys.stderr)
         _warned_tools.add(tool)
 
+
+# ── iCloud helpers ──────────────────────────────────────────────────────────
+
+def _is_icloud_stub(path: str) -> bool:
+    """Return True if the file is an iCloud stub (not yet downloaded locally)."""
+    try:
+        r = subprocess.run(
+            ["xattr", "-p", "com.apple.fileprovider.fpfs#P", path],
+            capture_output=True, timeout=0.5,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _ensure_local(path: str, timeout: float = 4.0) -> bool:
+    """Trigger iCloud download if the file is a stub. Returns True if file is local."""
+    if not _is_icloud_stub(path):
+        return True
+    try:
+        subprocess.run(["brctl", "download", path], capture_output=True, timeout=timeout)
+        return not _is_icloud_stub(path)
+    except (subprocess.TimeoutExpired, Exception):
+        return False
+
+
+# ── SQLite image index ──────────────────────────────────────────────────────
+
+def _get_db() -> sqlite3.Connection | None:
+    try:
+        INDEX_DB.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(INDEX_DB))
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS images (
+                path TEXT PRIMARY KEY,
+                mtime REAL NOT NULL,
+                size INTEGER NOT NULL,
+                caption TEXT NOT NULL,
+                indexed_at REAL NOT NULL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS images_fts
+                USING fts5(path, caption, content='images', content_rowid='rowid');
+            CREATE TRIGGER IF NOT EXISTS images_ai AFTER INSERT ON images BEGIN
+                INSERT INTO images_fts(rowid, path, caption)
+                VALUES (new.rowid, new.path, new.caption);
+            END;
+            CREATE TRIGGER IF NOT EXISTS images_ad AFTER DELETE ON images BEGIN
+                INSERT INTO images_fts(images_fts, rowid, path, caption)
+                VALUES ('delete', old.rowid, old.path, old.caption);
+            END;
+            CREATE TRIGGER IF NOT EXISTS images_au AFTER UPDATE ON images BEGIN
+                INSERT INTO images_fts(images_fts, rowid, path, caption)
+                VALUES ('delete', old.rowid, old.path, old.caption);
+                INSERT INTO images_fts(rowid, path, caption)
+                VALUES (new.rowid, new.path, new.caption);
+            END;
+        """)
+        conn.commit()
+        return conn
+    except Exception:
+        return None
+
+
+# ── Query analysis ──────────────────────────────────────────────────────────
 
 def analyse_query(client: anthropic.Anthropic, user_query: str) -> dict:
     prompt = f'''Analyse this file search query. The user is trying to find a file on their Mac.
@@ -59,7 +158,6 @@ Rules:
         messages=[{"role": "user", "content": prompt}],
     )
     text = next(b.text for b in resp.content if b.type == "text").strip()
-    # Strip markdown fences if present
     if text.startswith("```"):
         text = text.split("\n", 1)[1]
         if text.endswith("```"):
@@ -67,6 +165,8 @@ Rules:
         text = text.strip()
     return json.loads(text)
 
+
+# ── File discovery ──────────────────────────────────────────────────────────
 
 def run_mdfind(query: str) -> list[str]:
     try:
@@ -79,47 +179,30 @@ def run_mdfind(query: str) -> list[str]:
         return []
 
 
-def search_candidates(analysis: dict) -> list[str]:
-    seen = set()
-    results = []
+def search_candidates(analysis: dict, db: sqlite3.Connection | None = None) -> list[str]:
+    seen: set[str] = set()
+    mdfind_results: list[str] = []
+    image_hits: list[str] = []
 
-    skip_patterns = {
-        # macOS system
-        "/Library/", "/.Trash/", "/.Spotlight-V100/", "/.fseventsd/",
-        "/Photos Library.photoslibrary/",
-        # Caches & logs
-        "/Caches/", "/cache/", "/.cache/", "/logs/", "/CachedData/",
-        "/CachedProfilesData/", "/CachedExtensions/",
-        # Version control
-        "/.git/", "/.svn/", "/.hg/",
-        # Python
-        "/__pycache__/", "/.venv/", "/venv/", "/site-packages/",
-        "/.eggs/", "/.tox/", "/.mypy_cache/", "/.pytest_cache/",
-        # Node/JS
-        "/node_modules/", "/.next/", "/dist/", "/.nuxt/",
-        "/bower_components/",
-        # Build artifacts
-        "/build/", "/.build/", "/DerivedData/",
-        # IDE & editor
-        "/.idea/", "/.vscode/", "/.eclipse/",
-        # Package managers
-        "/.npm/", "/.yarn/", "/.pnpm/", "/.cargo/", "/.rustup/",
-        "/.gradle/", "/.m2/", "/.pub-cache/", "/Pods/",
-        # Other
-        "/.docker/", "/tmp/", "/.local/share/",
-    }
+    def _valid(p: str) -> bool:
+        return (p not in seen
+                and not any(s in p for s in SKIP_PATTERNS)
+                and os.path.isfile(p))
 
-    def add(paths: list[str]):
+    def add_mdfind(paths: list[str]):
         for p in paths:
-            if (p not in seen
-                and not any(s in p for s in skip_patterns)
-                and os.path.isfile(p)):
+            if _valid(p):
                 seen.add(p)
-                results.append(p)
+                mdfind_results.append(p)
+
+    def add_image(paths: list[str]):
+        for p in paths:
+            if _valid(p):
+                seen.add(p)
+                image_hits.append(p)
 
     keyword_sets = analysis.get("keyword_sets", [])
 
-    # Build all mdfind queries upfront
     queries = []
     for kw_set in keyword_sets:
         queries.append(" ".join(kw_set))
@@ -130,7 +213,7 @@ def search_candidates(analysis: dict) -> list[str]:
     if date_hint and keyword_sets:
         main_keyword = keyword_sets[0][0] if keyword_sets[0] else None
         if main_keyword:
-            if len(date_hint) == 7:  # YYYY-MM
+            if len(date_hint) == 7:
                 year, month = date_hint.split("-")
                 month_int = int(month)
                 if month_int == 12:
@@ -138,7 +221,7 @@ def search_candidates(analysis: dict) -> list[str]:
                 else:
                     end_date = f"{year}-{month_int + 1:02d}-01"
                 start_date = f"{date_hint}-01"
-            else:  # YYYY
+            else:
                 start_date = f"{date_hint}-01-01"
                 end_date = f"{int(date_hint) + 1}-01-01"
             queries.append(
@@ -147,18 +230,52 @@ def search_candidates(analysis: dict) -> list[str]:
                 f"kMDItemContentModificationDate < $time.iso({end_date})"
             )
 
-    # Run all mdfind passes in parallel
-    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+    # Image index hits first — so they're guaranteed a slot at the front of the read window
+    if db is not None:
+        search_text = analysis.get("context_summary", "")
+        if not search_text:
+            search_text = " ".join(" ".join(ks) for ks in keyword_sets)
+        if search_text:
+            try:
+                # FTS5 uses AND by default; join with OR so partial matches surface
+                fts_query = " OR ".join(
+                    w for w in search_text.replace('"', "").split() if len(w) > 2
+                )
+                rows = db.execute(
+                    "SELECT path FROM images_fts WHERE images_fts MATCH ? ORDER BY rank LIMIT 10",
+                    (fts_query,),
+                ).fetchall()
+                add_image([row[0] for row in rows])
+            except Exception:
+                pass
+
+    with ThreadPoolExecutor(max_workers=len(queries) or 1) as pool:
         futures = [pool.submit(run_mdfind, q) for q in queries]
         for f in futures:
-            add(f.result())
+            add_mdfind(f.result())
 
-    # Sort by modification date (most recent first) and cap
-    results.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return results[:MAX_CANDIDATES]
+    # Sort mdfind results by recency; image hits stay at front (already ranked by FTS)
+    mdfind_results.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    combined = image_hits + mdfind_results
+    return combined[:MAX_CANDIDATES]
 
 
-def read_file_content(path: str) -> str | None:
+# ── Content reading ─────────────────────────────────────────────────────────
+
+def read_file_content(path: str, db: sqlite3.Connection | None = None) -> str | None:
+    ext = Path(path).suffix.lower()
+
+    # Return cached caption for indexed images
+    if ext in IMAGE_EXTS:
+        if db is not None:
+            try:
+                row = db.execute("SELECT caption FROM images WHERE path = ?", (path,)).fetchone()
+                if row:
+                    return f"[image] {row[0]}"
+            except Exception:
+                pass
+        return None
+
     try:
         size = os.path.getsize(path)
         if size > MAX_FILE_SIZE:
@@ -166,14 +283,11 @@ def read_file_content(path: str) -> str | None:
     except OSError:
         return None
 
-    ext = Path(path).suffix.lower()
-
     if ext == ".pdf":
         return _read_pdf(path)
     if ext == ".docx":
         return _read_docx(path)
 
-    # Text-like files: try reading as UTF-8
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read(MAX_CONTENT_BYTES)
@@ -211,15 +325,23 @@ def _read_docx(path: str) -> str | None:
     return None
 
 
-def build_candidates_info(paths: list[str]) -> list[dict]:
+def build_candidates_info(paths: list[str], db: sqlite3.Connection | None = None) -> list[dict]:
+    top = paths[:MAX_READ_CANDIDATES]
+
+    # Trigger iCloud downloads in parallel before reading
+    icloud_paths = [p for p in top if _is_icloud_stub(p)]
+    if icloud_paths:
+        with ThreadPoolExecutor(max_workers=min(len(icloud_paths), 8)) as pool:
+            list(pool.map(lambda p: _ensure_local(p), icloud_paths))
+
     candidates = []
-    for i, path in enumerate(paths[:MAX_READ_CANDIDATES]):
+    for i, path in enumerate(top):
         try:
             stat = os.stat(path)
         except OSError:
             continue
 
-        content = read_file_content(path)
+        content = read_file_content(path, db)
         info = {
             "index": i,
             "filename": os.path.basename(path),
@@ -232,6 +354,8 @@ def build_candidates_info(paths: list[str]) -> list[dict]:
         candidates.append(info)
     return candidates
 
+
+# ── LLM ranking ─────────────────────────────────────────────────────────────
 
 def rank_candidates(
     client: anthropic.Anthropic,
@@ -279,6 +403,8 @@ Candidates:
     return json.loads(text)
 
 
+# ── Formatting helpers ───────────────────────────────────────────────────────
+
 def _format_date(timestamp: float) -> str:
     from datetime import datetime
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
@@ -292,70 +418,169 @@ def _format_size(size: int) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 
-def display_results(
-    user_query: str,
-    analysis: dict,
-    candidates: list[dict],
-    rankings: list[dict],
-):
-    print()
-    keywords_display = " | ".join(
-        " ".join(ks) for ks in analysis.get("keyword_sets", [])
-    )
-    filenames = analysis.get("filename_fragments", [])
-    if filenames:
-        keywords_display += " | filename:" + ",".join(filenames)
-    print(f'Searching for: "{user_query}"')
-    print(f"Keywords: {keywords_display}")
-    print(f"Found {len(candidates)} candidates, reading content...")
-    print()
-    print("Top results:")
-    print()
+# ── Image indexer ────────────────────────────────────────────────────────────
 
-    result_paths = []
-    for r in rankings:
-        idx = r["index"]
-        c = next((c for c in candidates if c["index"] == idx), None)
-        if not c:
-            continue
-        rank = r["rank"]
-        result_paths.append(c["path"])
-        print(f"  {rank}. {c['path']}")
-        print(f"     Modified: {c['modified']}  |  Size: {c['size']}")
-        print(f"     → {r['reason']}")
-        print()
+def _load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(DEFAULT_CONFIG)
+        print(f"  Created config: {CONFIG_FILE}", file=sys.stderr)
+    with open(CONFIG_FILE, "rb") as f:
+        return tomllib.load(f)
 
-    if not result_paths:
-        print("  No relevant results found. Try different search terms.")
+
+def _caption_batch(paths: list[str]) -> dict[str, str]:
+    """Call seek-caption binary on a batch of paths. Returns {path: caption}."""
+    if not CAPTION_BINARY.exists():
+        print(
+            f"  Error: caption binary not found at {CAPTION_BINARY}\n"
+            f"  Build it with: cd tools/caption && swiftc -O seek-caption.swift -o seek-caption",
+            file=sys.stderr,
+        )
+        return {}
+    try:
+        result = subprocess.run(
+            [str(CAPTION_BINARY)] + paths,
+            capture_output=True, text=True, timeout=60,
+        )
+        out = {}
+        for line in result.stdout.strip().splitlines():
+            try:
+                d = json.loads(line)
+                if "caption" in d:
+                    out[d["path"]] = d["caption"]
+            except json.JSONDecodeError:
+                pass
+        return out
+    except (subprocess.TimeoutExpired, Exception) as e:
+        print(f"  Warning: caption batch failed: {e}", file=sys.stderr)
+        return {}
+
+
+def run_index(args: list[str]):
+    rebuild = "--rebuild" in args
+    status_only = "--status" in args
+
+    config = _load_config()
+    idx = config.get("index", {})
+    folders = [Path(f).expanduser() for f in idx.get("folders", ["~/Downloads", "~/Desktop"])]
+    extensions = {"." + e.lstrip(".").lower() for e in idx.get("extensions", list(IMAGE_EXTS))}
+    max_bytes = idx.get("max_image_bytes", 20_000_000)
+
+    db = _get_db()
+    if db is None:
+        print("Error: cannot open index database.", file=sys.stderr)
+        sys.exit(1)
+
+    if status_only:
+        rows = db.execute("SELECT COUNT(*), MAX(indexed_at) FROM images").fetchone()
+        count, last = rows
+        last_str = _format_date(last) if last else "never"
+        print(f"Index: {count} images, last indexed {last_str}")
+        for folder in folders:
+            n = db.execute(
+                "SELECT COUNT(*) FROM images WHERE path LIKE ?", (str(folder) + "%",)
+            ).fetchone()[0]
+            print(f"  {folder}: {n} images")
         return
 
-    # Interactive selection
-    while True:
-        try:
-            choice = input(f"Open file [1-{len(result_paths)}] or [q]uit: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if choice.lower() in ("q", "quit", ""):
-            break
-        try:
-            num = int(choice)
-            if 1 <= num <= len(result_paths):
-                subprocess.run(["open", result_paths[num - 1]])
-            else:
-                print(f"  Enter 1-{len(result_paths)} or q")
-        except ValueError:
-            print(f"  Enter 1-{len(result_paths)} or q")
+    if rebuild:
+        db.execute("DELETE FROM images")
+        db.commit()
+        print("  Rebuilt: index cleared.", file=sys.stderr)
 
+    # Walk folders and collect candidates
+    queue: list[str] = []
+    skipped = 0
+    for folder in folders:
+        if not folder.exists():
+            print(f"  Skipping (not found): {folder}", file=sys.stderr)
+            continue
+        for root, dirs, files in os.walk(folder):
+            # Prune skip patterns in-place
+            dirs[:] = [
+                d for d in dirs
+                if not any(s in (root + "/" + d + "/") for s in SKIP_PATTERNS)
+            ]
+            for fname in files:
+                path = os.path.join(root, fname)
+                ext = Path(path).suffix.lower()
+                if ext not in extensions:
+                    continue
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                if stat.st_size > max_bytes:
+                    skipped += 1
+                    continue
+                row = db.execute(
+                    "SELECT mtime FROM images WHERE path = ?", (path,)
+                ).fetchone()
+                if row and abs(row[0] - stat.st_mtime) < 1:
+                    continue  # up to date
+                queue.append(path)
+
+    total = len(queue)
+    print(f"  {total} images to caption ({skipped} skipped, too large).", file=sys.stderr)
+    if total == 0:
+        print("  Index is up to date.")
+        db.close()
+        return
+
+    indexed = 0
+    for i in range(0, total, CAPTION_BATCH):
+        batch = queue[i : i + CAPTION_BATCH]
+        captions = _caption_batch(batch)
+        now = time.time()
+        for path in batch:
+            caption = captions.get(path)
+            if caption is None:
+                continue
+            try:
+                stat = os.stat(path)
+                db.execute(
+                    "INSERT OR REPLACE INTO images (path, mtime, size, caption, indexed_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (path, stat.st_mtime, stat.st_size, caption, now),
+                )
+            except OSError:
+                pass
+        db.commit()
+        indexed += len(captions)
+        print(f"  [indexed {indexed}/{total}]", file=sys.stderr)
+
+    # Garbage-collect removed files
+    all_paths = [row[0] for row in db.execute("SELECT path FROM images").fetchall()]
+    removed = 0
+    for path in all_paths:
+        if not os.path.isfile(path):
+            db.execute("DELETE FROM images WHERE path = ?", (path,))
+            removed += 1
+    if removed:
+        db.commit()
+        print(f"  Removed {removed} stale entries.", file=sys.stderr)
+
+    print(f"Done. Indexed {indexed} images.")
+    db.close()
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     args = sys.argv[1:]
+
+    if args and args[0] == "index":
+        run_index(args[1:])
+        return
+
     json_mode = "--json" in args
     if json_mode:
         args.remove("--json")
 
     if not args:
         print("Usage: seek <natural language description>")
+        print('       seek index [--rebuild] [--status]')
         print('Example: seek "the grants playbook I made for Frank"')
         sys.exit(1)
 
@@ -366,15 +591,12 @@ def main():
         print("Error: DASHSCOPE_API_KEY environment variable not set.", file=sys.stderr)
         sys.exit(1)
 
-    import time
     t0 = time.time()
-
-    # In JSON mode, all status output goes to stderr to keep stdout clean
     log = (lambda msg: print(msg, file=sys.stderr)) if json_mode else print
 
+    db = _get_db()
     client = anthropic.Anthropic(api_key=api_key, base_url=BASE_URL)
 
-    # Step 1: Analyse query
     log(f'Searching for: "{user_query}"')
     t1 = time.time()
     analysis = analyse_query(client, user_query)
@@ -388,32 +610,32 @@ def main():
         keywords_display += " | filename:" + ",".join(filenames)
     log(f"Keywords: {keywords_display}")
 
-    # Step 2: Multi-pass mdfind
     t2 = time.time()
-    paths = search_candidates(analysis)
-    print(f"  [mdfind: {time.time()-t2:.1f}s]", file=sys.stderr)
+    paths = search_candidates(analysis, db)
+    print(f"  [mdfind+index: {time.time()-t2:.1f}s]", file=sys.stderr)
     if not paths:
         log("\nNo files found. Try different search terms.")
+        if db:
+            db.close()
         sys.exit(0)
 
     log(f"Found {len(paths)} candidates, reading content...")
 
-    # Step 3: Read candidates
     t3 = time.time()
-    candidates = build_candidates_info(paths)
+    candidates = build_candidates_info(paths, db)
     print(f"  [read files: {time.time()-t3:.1f}s]", file=sys.stderr)
     if not candidates:
         print("\nCouldn't read any candidate files.")
+        if db:
+            db.close()
         sys.exit(0)
 
-    # Step 4: Rank with LLM
     context_summary = analysis.get("context_summary", user_query)
     t4 = time.time()
     rankings = rank_candidates(client, user_query, context_summary, candidates)
     print(f"  [rank: {time.time()-t4:.1f}s]", file=sys.stderr)
     print(f"  [total: {time.time()-t0:.1f}s]", file=sys.stderr)
 
-    # Step 5: Build results
     results = []
     for r in rankings:
         idx = r["index"]
@@ -430,12 +652,13 @@ def main():
             "reason": r["reason"],
         })
 
-    # JSON mode for Raycast / programmatic use
+    if db:
+        db.close()
+
     if json_mode:
         print(json.dumps(results, indent=2))
         return
 
-    # Display results
     print()
     print("Top results:")
     print()
@@ -452,7 +675,6 @@ def main():
         print(f"     → {r['reason']}")
         print()
 
-    # Interactive prompt only in terminal
     if not sys.stdin.isatty():
         return
 
