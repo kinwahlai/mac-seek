@@ -39,7 +39,7 @@ fallback_models = [
 
 # To use local MLX inference instead (Apple Silicon only, requires `make install-mlx`):
 # provider = "mlx"
-# model = "mlx-community/Qwen2.5-3B-Instruct-4bit"
+# model = "mlx-community/Qwen3-1.7B-4bit"
 
 [index]
 folders = [
@@ -194,7 +194,13 @@ def _mlx_load(model_id: str) -> tuple:
 def _mlx_call(model_id: str, max_tokens: int, messages: list[dict]) -> str:
     from mlx_lm import generate  # type: ignore
     model, tokenizer = _mlx_load(model_id)
-    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    try:
+        # Qwen3 and compatible models: disable thinking mode for fast, direct JSON output
+        prompt = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False, enable_thinking=False
+        )
+    except TypeError:
+        prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     return generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False).strip()
 
 

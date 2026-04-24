@@ -129,18 +129,18 @@ Then edit `~/.config/seek/config.toml`:
 ```toml
 [llm]
 provider = "mlx"
-model = "mlx-community/Qwen2.5-3B-Instruct-4bit"
+model = "mlx-community/Qwen3-1.7B-4bit"
 ```
 
-The model (~2GB) is downloaded from HuggingFace on first use into `~/.cache/huggingface/hub/`. Subsequent runs load from disk.
+The model (~1.1GB) is downloaded from HuggingFace on first use into `~/.cache/huggingface/hub/`. Subsequent runs load from disk. Thinking mode is automatically disabled for fast, direct JSON output.
 
 **Recommended models** (4-bit quantized, comfortable on 16GB Macs):
 
 | Model | Size | Notes |
 |---|---|---|
-| `mlx-community/Qwen2.5-3B-Instruct-4bit` | ~2GB | Best JSON reliability for size |
-| `mlx-community/Llama-3.2-3B-Instruct-4bit` | ~2GB | Meta's small instruct model |
-| `mlx-community/Qwen2.5-7B-Instruct-4bit` | ~5GB | Better quality, slower load |
+| `mlx-community/Qwen3-1.7B-4bit` | ~1.1GB | Recommended — best quality/size ratio |
+| `mlx-community/Qwen3-4B-4bit` | ~2.5GB | Better ranking quality, slower load |
+| `mlx-community/Qwen2.5-3B-Instruct-4bit` | ~2GB | Fallback if Qwen3 unavailable |
 
 To switch back to OpenRouter, remove the `provider` and `model` lines (or comment them out).
 
