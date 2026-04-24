@@ -24,10 +24,6 @@ seek.py                        # Main CLI — single-file, all logic here
 tools/caption/
   seek-caption.swift           # Vision OCR+classification captioner source
   seek-caption                 # Compiled binary (gitignored — build with swiftc below)
-raycast-extension/             # Raycast extension (TypeScript/React)
-  src/seek.tsx                 # Extension source — List with detail panel
-  package.json                 # Extension manifest and dependencies
-  assets/command-icon.png      # Extension icon
 .env                           # OPENROUTER_API_KEY (gitignored)
 semantic-file-search-spec.md   # Original project spec
 ```
@@ -44,7 +40,7 @@ Runtime data (not in repo):
 # Run from project dir
 python seek.py "your natural language query"
 
-# JSON output (used by Raycast extension)
+# JSON output mode (machine-readable)
 python seek.py --json "your query"
 
 # If installed to PATH (~/.local/bin/seek):
@@ -54,12 +50,6 @@ seek "your natural language query"
 seek index                     # incremental: caption new/changed images only
 seek index --rebuild           # wipe and re-caption everything
 seek index --status            # show row count and last indexed date
-
-# Raycast extension: build production
-cd raycast-extension && npm run build
-
-# Raycast extension: development mode
-cd raycast-extension && npm run dev
 ```
 
 ## Dependencies
@@ -70,9 +60,6 @@ brew install poppler pandoc  # Optional — for PDF/docx content extraction
 
 # Build the caption helper (one-time, needs macOS CLI tools with Swift)
 cd tools/caption && swiftc -O seek-caption.swift -o seek-caption
-
-# Raycast extension
-cd raycast-extension && npm install
 ```
 
 **Note:** The caption helper uses Apple's Vision framework (OCR + image classification) which ships with macOS — no extra deps. Full generative captions via Foundation Models would require Xcode installed, which is not currently set up.
@@ -92,20 +79,9 @@ cd raycast-extension && npm install
 - **Caption helper**: `tools/caption/seek-caption` — Swift binary using Vision `VNRecognizeTextRequest` (OCR) + `VNClassifyImageRequest` (scene labels, threshold 0.1). Accepts multiple paths as args, outputs one JSON line per image. Invoked in batches of 20 from Python.
 - **mdfind scoped to `~`** to avoid system files; each pass has 5-second timeout; all passes run in parallel
 - **Graceful degradation**: pdftotext/pandoc are optional; warns once if missing, falls back to filename/metadata matching
-- **`--json` flag**: outputs clean JSON to stdout, all status lines to stderr. Used by the Raycast extension
+- **`--json` flag**: outputs clean JSON to stdout, all status lines to stderr. Useful for scripting or future integrations
 - **Installation**: symlinked to `~/.local/bin/seek` — shebang uses `#!/usr/bin/env python3`
 - **Timing diagnostics**: printed to stderr for performance monitoring
-
-## Raycast Integration
-
-`raycast-extension/` — TypeScript/React extension with:
-- In-view search bar with 1.5s debounce (prevents cancellation during ~10s search)
-- Interactive list with confidence-colored icons and % tags
-- Detail panel showing LLM reasoning, full path, and metadata
-- Actions: Open File, Show in Finder, Copy Path, Open in VS Code, Open Config (`⌘,`)
-- Requires `seek` on PATH — calls `bash -lc "seek --json ..."` for login-shell PATH resolution
-- `npm run dev` to register in Raycast Development section
-- `npm run build` for production build
 
 ## Future Enhancements
 

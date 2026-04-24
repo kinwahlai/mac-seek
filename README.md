@@ -125,28 +125,6 @@ Configure which folders and file types to index in `~/.config/seek/config.toml` 
 
 ---
 
-## Raycast extension
-
-The `raycast-extension/` directory is a full Raycast extension with an interactive list view, confidence scores, detail panel, and file actions.
-
-**Requirements:** `seek` must be installed to PATH (step 5 above).
-
-```bash
-cd raycast-extension
-npm install
-npm run dev    # registers in Raycast under "Development"
-npm run build  # production build
-```
-
-**Actions per result:**
-- `↵` Open file
-- `⌘⇧F` Show in Finder
-- `⌘.` Copy path
-- `⌘⇧.` Open in VS Code
-- `⌘,` Open config (`~/.config/seek/config.toml`)
-
----
-
 ## iCloud
 
 Files offloaded to iCloud (not yet downloaded locally) are automatically downloaded before content reading, with a 4-second timeout per file. If the download times out, the file is ranked on filename and metadata only.

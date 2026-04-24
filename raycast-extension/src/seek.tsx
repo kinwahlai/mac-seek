@@ -181,7 +181,7 @@ export default function Command() {
                 title="Open Config"
                 target={CONFIG_FILE}
                 icon={Icon.Gear}
-                shortcut={{ modifiers: ["cmd"], key: "," }}
+                shortcut={{ modifiers: ["cmd", "shift"], key: "," }}
               />
             </ActionPanel>
           }
