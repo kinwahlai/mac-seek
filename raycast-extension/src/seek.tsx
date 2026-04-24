@@ -13,10 +13,8 @@ interface SeekResult {
   reason: string;
 }
 
-const PYTHON = "/opt/homebrew/anaconda3/bin/python3";
-const SEEK_PY = `${homedir()}/dev_repo/AI-projects/mac-seek/seek.py`;
-const ENV_FILE = `${homedir()}/dev_repo/AI-projects/mac-seek/.env`;
 const HOME = homedir();
+const CONFIG_FILE = `${HOME}/.config/seek/config.toml`;
 const DEBOUNCE_MS = 1500;
 
 function confidenceColor(confidence: number): Color {
@@ -58,11 +56,8 @@ function useSeek(query: string) {
 
     const escaped = q.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$").replace(/`/g, "\\`");
     const child = execFile(
-      "bash",
-      [
-        "-c",
-        `export DASHSCOPE_API_KEY="$(grep DASHSCOPE_API_KEY '${ENV_FILE}' | cut -d= -f2)" && "${PYTHON}" "${SEEK_PY}" --json "${escaped}" 2>/dev/null`,
-      ],
+      "/bin/bash",
+      ["-lc", `seek --json "${escaped}" 2>/dev/null`],
       { timeout: 60000 },
       (error, stdout, stderr) => {
         if (cancelled) return;
@@ -123,6 +118,11 @@ export default function Command() {
           icon={Icon.MagnifyingGlass}
           title="Seek Files"
           description="Type a description of the file you're looking for (3+ characters)"
+          actions={
+            <ActionPanel>
+              <Action.Open title="Open Config" target={CONFIG_FILE} icon={Icon.Gear} />
+            </ActionPanel>
+          }
         />
       )}
 
@@ -131,6 +131,11 @@ export default function Command() {
           icon={Icon.XMarkCircle}
           title="No Results"
           description={`No files found matching "${searchText}"`}
+          actions={
+            <ActionPanel>
+              <Action.Open title="Open Config" target={CONFIG_FILE} icon={Icon.Gear} />
+            </ActionPanel>
+          }
         />
       )}
 
@@ -171,6 +176,12 @@ export default function Command() {
                 target={item.path}
                 application="Visual Studio Code"
                 shortcut={{ modifiers: ["cmd", "shift"], key: "." }}
+              />
+              <Action.Open
+                title="Open Config"
+                target={CONFIG_FILE}
+                icon={Icon.Gear}
+                shortcut={{ modifiers: ["cmd"], key: "," }}
               />
             </ActionPanel>
           }

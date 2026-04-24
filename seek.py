@@ -1,4 +1,4 @@
-#!/opt/homebrew/anaconda3/bin/python3
+#!/usr/bin/env python3
 """Semantic file search for macOS — find files by natural language description."""
 
 import json
@@ -160,7 +160,7 @@ Return JSON only, no explanation:
     ["broader", "terms"],
     ["single_key_noun"]
   ],
-  "filename_fragments": ["snaic", "notes"],
+  "filename_fragments": ["meeting", "notes"],
   "date_hint": "2025-03" or null,
   "file_type_hint": "document" or "code" or "spreadsheet" or null,
   "context_summary": "One sentence describing what the user is actually looking for, including situational context"
@@ -612,7 +612,7 @@ def main():
     if not args:
         print("Usage: seek <natural language description>")
         print('       seek index [--rebuild] [--status]')
-        print('Example: seek "the grants playbook I made for Frank"')
+        print('Example: seek "the budget spreadsheet from the Q3 review"')
         sys.exit(1)
 
     user_query = " ".join(args)

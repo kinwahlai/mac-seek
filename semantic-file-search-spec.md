@@ -2,19 +2,19 @@
 
 ## What this is
 
-A macOS CLI tool that finds files you can't name but can describe. You type a natural language description — including situational context like "during that meeting" or "notes I took at the SNAIC session" — and it searches your filesystem, reads candidate content, and uses an LLM to rank results by semantic relevance.
+A macOS CLI tool that finds files you can't name but can describe. You type a natural language description — including situational context like "during that meeting" or "notes I took at the onboarding session" — and it searches your filesystem, reads candidate content, and uses an LLM to rank results by semantic relevance.
 
 ## Why
 
-Spotlight and `mdfind` are keyword-only. When you remember the context but not the filename — "a file I wrote during the SNAIC info session about what's covered in the interview" — they fail. This bridges that gap.
+Spotlight and `mdfind` are keyword-only. When you remember the context but not the filename — "a file I wrote during the onboarding session about the team structure" — they fail. This bridges that gap.
 
 ## Example queries
 
 ```
-$ seek "the grants playbook I made for Frank with the 13 programmes"
-$ seek "a file I wrote during the SNAIC info session about interview coverage"
-$ seek "that python script for scraping Facebook posts for the compliance project"
-$ seek "notes from Sharon about grounding protocols for coaching intensives"
+$ seek "the budget spreadsheet I put together for the Q3 review"
+$ seek "notes I took during the onboarding session about the team structure"
+$ seek "that python script for parsing the weekly CSV exports"
+$ seek "the slide deck from last month's product planning meeting"
 ```
 
 ## How it works
@@ -24,9 +24,9 @@ $ seek "notes from Sharon about grounding protocols for coaching intensives"
    - **Context clues** — date hints, file type hints, situational context (e.g. "during a session" suggests notes/meeting docs)
 
 2. **Multi-pass mdfind** — Run multiple searches and merge results (deduplicated by path):
-   - Pass 1: Specific terms combined (e.g. `mdfind "SNAIC interview"`)
-   - Pass 2: Key noun alone (e.g. `mdfind "SNAIC"`)
-   - Pass 3: Filename search (e.g. `mdfind "kMDItemDisplayName == '*snaic*'cd"`)
+   - Pass 1: Specific terms combined (e.g. `mdfind "onboarding team structure"`)
+   - Pass 2: Key noun alone (e.g. `mdfind "onboarding"`)
+   - Pass 3: Filename search (e.g. `mdfind "kMDItemDisplayName == '*onboarding*'cd"`)
    - Pass 4 (if date clues): Add date filter
    - Scope all passes to `~` to avoid system files
    - Collect up to 50 unique candidates across all passes
@@ -46,9 +46,9 @@ $ seek "notes from Sharon about grounding protocols for coaching intensives"
 ## Technical details
 
 - **Language:** Python 3 (single file, no framework)
-- **LLM:** Anthropic API via `anthropic` Python SDK
-  - Use `claude-haiku-4-5-20251001` for both query analysis and ranking
-  - API key from environment variable `ANTHROPIC_API_KEY`
+- **LLM:** Any OpenAI-compatible endpoint via `openai` Python SDK
+  - Default: `google/gemini-2.0-flash-lite-001` via [OpenRouter](https://openrouter.ai) (configurable)
+  - API key and model configured in `~/.config/seek/config.toml` or env vars
 - **macOS APIs:** `mdfind` via subprocess
 - **File reading:** UTF-8 with error ignoring. Skip files > 5MB.
 - **Rich format extraction:** `pdftotext` and `pandoc` via subprocess. Optional — if not installed, fall back to filename/metadata only and print a one-time warning suggesting `brew install poppler pandoc`.
@@ -70,7 +70,7 @@ Return JSON only, no explanation:
     ["broader", "terms"],
     ["single_key_noun"]
   ],
-  "filename_fragments": ["snaic", "notes"],
+  "filename_fragments": ["onboarding", "notes"],
   "date_hint": "2025-03" or null,
   "file_type_hint": "document" or "code" or "spreadsheet" or null,
   "context_summary": "One sentence describing what the user is actually looking for, including situational context"
@@ -116,16 +116,16 @@ Candidates:
 
 ```bash
 # Pass 1: Specific multi-keyword
-mdfind -onlyin ~ "SNAIC interview"
+mdfind -onlyin ~ "onboarding team structure"
 
 # Pass 2: Broader single-keyword
-mdfind -onlyin ~ "SNAIC"
+mdfind -onlyin ~ "onboarding"
 
 # Pass 3: Filename search (case-insensitive, diacritic-insensitive)
-mdfind -onlyin ~ "kMDItemDisplayName == '*snaic*'cd"
+mdfind -onlyin ~ "kMDItemDisplayName == '*onboarding*'cd"
 
 # Pass 4: Date-scoped (if date_hint present, e.g. 2025-03)
-mdfind -onlyin ~ "SNAIC && kMDItemContentModificationDate >= $time.iso(2025-03-01) && kMDItemContentModificationDate < $time.iso(2025-04-01)"
+mdfind -onlyin ~ "onboarding && kMDItemContentModificationDate >= $time.iso(2025-03-01) && kMDItemContentModificationDate < $time.iso(2025-04-01)"
 ```
 
 Each pass has a 5-second timeout. Results are merged and deduplicated by absolute path.
@@ -133,23 +133,23 @@ Each pass has a 5-second timeout. Results are merged and deduplicated by absolut
 ## Output format
 
 ```
-Searching for: "a file I wrote during the SNAIC info session about interview coverage"
-Keywords: SNAIC, info session, interview | SNAIC | filename:snaic
-Found 23 candidates, reading content...
+Searching for: "notes I took during the onboarding session about the team structure"
+Keywords: onboarding, team structure | onboarding | filename:onboarding
+Found 18 candidates, reading content...
 
 Top results:
 
-1. ~/Documents/Career/snaic-info-session-notes.md
-   Modified: 2025-03-12  |  Size: 4.2 KB
-   → Session notes mentioning interview topics, behavioural questions, and case prep covered during SNAIC info session
+1. ~/Documents/Work/onboarding-notes.md
+   Modified: 2025-03-12  |  Size: 4.2 KB  |  Confidence: ██████████ 95%
+   → Notes from onboarding session covering team structure, reporting lines, and key contacts
 
-2. ~/Documents/Career/interview-prep.md
-   Modified: 2025-03-14  |  Size: 8.1 KB
-   → Interview preparation notes that reference SNAIC guidance on competency frameworks
+2. ~/Documents/Work/team-overview.md
+   Modified: 2025-03-14  |  Size: 8.1 KB  |  Confidence: ████████░░ 80%
+   → Team structure document referenced during onboarding
 
-3. ~/Desktop/SNAIC-slides-summary.txt
-   Modified: 2025-03-11  |  Size: 2.3 KB
-   → Summary of slides from SNAIC event, includes section on interview process
+3. ~/Desktop/org-chart-draft.pdf
+   Modified: 2025-03-11  |  Size: 2.3 KB  |  Confidence: ██████░░░░ 60%
+   → Org chart PDF shared during onboarding week
 
 Open file [1-5] or [q]uit:
 ```
@@ -167,13 +167,13 @@ Open file [1-5] or [q]uit:
 ## Installation
 
 ```bash
-pip install anthropic
+pip install openai
 # Optional but recommended for rich file search:
 brew install poppler pandoc
-# Save script as ~/bin/seek
-chmod +x ~/bin/seek
-# Add to PATH if needed:
-export PATH="$HOME/bin:$PATH"
+# Symlink to PATH
+ln -sf "$(pwd)/seek.py" ~/.local/bin/seek
+chmod +x seek.py
+# Set your OpenRouter API key in ~/.config/seek/config.toml or env
 ```
 
 ## Stretch goals (don't build yet)
@@ -190,4 +190,4 @@ export PATH="$HOME/bin:$PATH"
 - Sub-8-second response for typical queries (2 LLM calls + mdfind + file reading)
 - Finds the right file in top 3 results at least 80% of the time
 - Total cost per search: < $0.02 (Haiku pricing, two calls)
-- Works with zero config — just needs ANTHROPIC_API_KEY set
+- Works with zero config — just needs an OpenRouter API key in `~/.config/seek/config.toml`

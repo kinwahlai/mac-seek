@@ -2,6 +2,11 @@
 tools/caption/seek-caption
 tools/caption/*.o
 __pycache__/
+*.pyc
 .claude/
+.DS_Store
+.ruff_cache/
+dist/
+*.log
 raycast-extension/node_modules/
 raycast-extension/raycast-env.d.ts

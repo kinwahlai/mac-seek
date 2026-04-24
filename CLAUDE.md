@@ -24,7 +24,6 @@ seek.py                        # Main CLI — single-file, all logic here
 tools/caption/
   seek-caption.swift           # Vision OCR+classification captioner source
   seek-caption                 # Compiled binary (gitignored — build with swiftc below)
-raycast/seek.sh                # Raycast script command wrapper (alias: sk)
 raycast-extension/             # Raycast extension (TypeScript/React)
   src/seek.tsx                 # Extension source — List with detail panel
   package.json                 # Extension manifest and dependencies
@@ -94,23 +93,17 @@ cd raycast-extension && npm install
 - **mdfind scoped to `~`** to avoid system files; each pass has 5-second timeout; all passes run in parallel
 - **Graceful degradation**: pdftotext/pandoc are optional; warns once if missing, falls back to filename/metadata matching
 - **`--json` flag**: outputs clean JSON to stdout, all status lines to stderr. Used by the Raycast extension
-- **Python path**: hardcoded to `/opt/homebrew/anaconda3/bin/python3` where `openai` SDK is installed
-- **Installation**: symlinked to `~/.local/bin/seek`
+- **Installation**: symlinked to `~/.local/bin/seek` — shebang uses `#!/usr/bin/env python3`
 - **Timing diagnostics**: printed to stderr for performance monitoring
 
 ## Raycast Integration
 
-Two options available:
-
-### Script Command (simple)
-`raycast/seek.sh` — text output in fullOutput mode. Add the `raycast/` directory as a Script Commands directory in Raycast settings. Set alias to `sk`.
-
-### Extension (interactive)
 `raycast-extension/` — TypeScript/React extension with:
 - In-view search bar with 1.5s debounce (prevents cancellation during ~10s search)
 - Interactive list with confidence-colored icons and % tags
 - Detail panel showing LLM reasoning, full path, and metadata
-- Actions: Open File, Show in Finder, Copy Path, Open in VS Code
+- Actions: Open File, Show in Finder, Copy Path, Open in VS Code, Open Config (`⌘,`)
+- Requires `seek` on PATH — calls `bash -lc "seek --json ..."` for login-shell PATH resolution
 - `npm run dev` to register in Raycast Development section
 - `npm run build` for production build
 
