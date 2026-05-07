@@ -15,9 +15,9 @@ seek "the image with hold and let go written on it"
 
 ## Quick start
 
-### 1. Get an OpenRouter API key
+### 1. Get a Google AI Studio API key
 
-[openrouter.ai/keys](https://openrouter.ai/keys) — free account, no credit card required for free-tier models.
+[aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free account, free-tier-friendly.
 
 ### 2. Install
 
@@ -34,35 +34,25 @@ brew install poppler pandoc
 
 ### 3. Configure
 
-Add your API key to `~/.config/seek/config.toml` (created automatically on first run):
-
-```toml
-[llm]
-api_key = "sk-or-..."   # paste your OpenRouter key here
+Export your API key:
+```bash
+export GEMINI_API_KEY="..."
 ```
 
-Full config reference (two-tier provider + search filters):
+Or paste it into `~/.config/seek/config.toml` (created automatically on first run):
 
 ```toml
-# Primary provider — OpenRouter (cloud)
 [llm]
-api_key_env = "OPENROUTER_API_KEY"
-base_url = "https://openrouter.ai/api/v1"
-model = "google/gemini-2.0-flash-lite-001"
-fallback_models = [
-  "tencent/hy3-preview:free",
-  "openrouter/free",
-  "nvidia/nemotron-3-super-120b-a12b:free",
-]
+api_key = "..."
+```
 
-# Optional fallback — local Rapid-MLX (Apple Silicon).
-# Triggered when the primary errors out, returns malformed JSON, or shape-mismatches.
-# Run `make install-mlx` first; seek auto-spawns the daemon on demand.
-[llm.fallback]
-base_url = "http://localhost:8000/v1"
-model = "default"
-local_model = "llama3-3b"      # ~1.9 GB, no thinking mode
-idle_timeout_seconds = 900     # daemon self-exits after this many idle seconds
+Full config reference:
+
+```toml
+[llm]
+api_key_env = "GEMINI_API_KEY"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+model = "gemini-2.5-flash-lite"
 
 [index]
 folders = ["~/Downloads", "~/Desktop"]
@@ -105,75 +95,30 @@ Pick a number to open the file, or `q` to quit.
 
 | Method | Example |
 |---|---|
-| Env var | `SEEK_LLM_MODEL=meta-llama/llama-3.3-70b-instruct:free seek "..."` |
-| Config `[llm]` section | `model = "gpt-4o-mini"` in config.toml |
-| Built-in default | `google/gemini-2.0-flash-lite-001` via OpenRouter |
+| Env var | `SEEK_LLM_MODEL=gemini-2.5-flash seek "..."` |
+| Config `[llm]` section | `model = "gemini-2.5-flash"` in config.toml |
+| Built-in default | `gemini-2.5-flash-lite` via Google AI Studio |
 
-Override env vars: `SEEK_LLM_MODEL`, `SEEK_LLM_BASE_URL`, `SEEK_LLM_API_KEY_ENV`. These apply only to `[llm]` (primary) — `[llm.fallback]` is untouched.
+Override env vars: `SEEK_LLM_MODEL`, `SEEK_LLM_BASE_URL`, `SEEK_LLM_API_KEY_ENV`.
 
 ### Switching providers
 
-Edit the `[llm]` section in `~/.config/seek/config.toml`:
+Any OpenAI-compatible endpoint works. Edit `[llm]` in `~/.config/seek/config.toml`:
 
 ```toml
+# Bigger Gemini model (still free tier, double the RPM)
+model = "gemini-2.5-flash"
+
 # OpenAI
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 api_key_env = "OPENAI_API_KEY"
 
-# Any OpenAI-compatible endpoint
-base_url = "https://your-endpoint/v1"
-model = "your-model-name"
-api_key = "your-key"
+# OpenRouter
+base_url = "https://openrouter.ai/api/v1"
+model = "google/gemini-2.0-flash-lite-001"
+api_key_env = "OPENROUTER_API_KEY"
 ```
-
----
-
-## Local inference (Rapid-MLX, Apple Silicon)
-
-Run inference on-device — no per-search cost, no network — with cloud as a safety net.
-
-```bash
-make install-mlx
-```
-
-This installs [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX) (an OpenAI-compatible local server) into the existing venv and symlinks `~/.local/bin/rapid-mlx`.
-
-### Two ways to wire it up
-
-**Cloud-primary, local fallback** (the default config above): the local daemon is only spawned when OpenRouter errors out, returns malformed JSON, or shape-mismatches. Free safety net at the cost of an occasional ~6s cold boot.
-
-**Local-primary, cloud fallback**: swap the two sections — put Rapid-MLX in `[llm]` and OpenRouter in `[llm.fallback]`. Best for sustained offline use.
-
-```toml
-[llm]
-base_url = "http://localhost:8000/v1"
-model = "default"
-local_model = "llama3-3b"      # ~1.9 GB, no thinking mode
-idle_timeout_seconds = 900     # daemon self-exits after N idle seconds
-```
-
-The first query downloads the model (~1.9 GB) and boots the daemon (~6s cold, ~1s warm). A watchdog process self-terminates the daemon after `idle_timeout_seconds` (default 15 min) of inactivity. No API key needed — seek auto-injects a dummy `"local"` key for localhost endpoints.
-
-### Server commands
-
-```bash
-seek server start    # spawn the daemon explicitly (otherwise auto-spawned on demand)
-seek server stop     # kill the daemon
-seek server status   # show pid, port, last-used time
-```
-
-State files: `~/.local/share/seek/rapid-mlx.{pid,last_used,log}`.
-
-### Local model options
-
-| `local_model` | Size | Notes |
-|---|---|---|
-| `llama3-3b` | ~1.9 GB | **Recommended** — empirical winner for this task |
-| `ministral-3b` | ~1.9 GB | Verbose JSON; can hit `max_tokens` on the rank step |
-| `phi4-14b` | ~8.5 GB | Higher quality, slower load, more RAM |
-
-`llama3-3b` is the default because `qwen3.5-4b`'s mandatory thinking mode (3072 tokens, 99s) blocked usage and `ministral-3b`'s verbosity truncated the rank step. Models live in Rapid-MLX's cache directory.
 
 ---
 
@@ -202,7 +147,7 @@ Files offloaded to iCloud (not yet downloaded locally) are automatically downloa
 | Dependency | Required | Purpose |
 |---|---|---|
 | Python 3.9+ | Yes | Runtime |
-| `openai` (pip) | Yes | LLM API (OpenRouter-compatible) |
+| `openai` (pip) | Yes | OpenAI-compatible LLM API |
 | `pdftotext` (`poppler`) | No | PDF content reading |
 | `pandoc` | No | Word doc content reading |
 | macOS CLI tools | Yes (for image index) | Compile `seek-caption` Swift binary |
