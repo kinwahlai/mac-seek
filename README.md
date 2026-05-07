@@ -41,11 +41,12 @@ Add your API key to `~/.config/seek/config.toml` (created automatically on first
 api_key = "sk-or-..."   # paste your OpenRouter key here
 ```
 
-Full config reference:
+Full config reference (two-tier provider + search filters):
 
 ```toml
+# Primary provider — OpenRouter (cloud)
 [llm]
-api_key = "sk-or-..."
+api_key_env = "OPENROUTER_API_KEY"
 base_url = "https://openrouter.ai/api/v1"
 model = "google/gemini-2.0-flash-lite-001"
 fallback_models = [
@@ -54,16 +55,28 @@ fallback_models = [
   "nvidia/nemotron-3-super-120b-a12b:free",
 ]
 
+# Optional fallback — local Rapid-MLX (Apple Silicon).
+# Triggered when the primary errors out, returns malformed JSON, or shape-mismatches.
+# Run `make install-mlx` first; seek auto-spawns the daemon on demand.
+[llm.fallback]
+base_url = "http://localhost:8000/v1"
+model = "default"
+local_model = "llama3-3b"      # ~1.9 GB, no thinking mode
+idle_timeout_seconds = 900     # daemon self-exits after this many idle seconds
+
 [index]
 folders = ["~/Downloads", "~/Desktop"]
 extensions = ["jpg", "jpeg", "png", "heic", "gif", "webp", "tiff"]
 max_image_bytes = 20_000_000
 
 [search]
-max_candidates = 30      # files collected from mdfind + image index
-max_read_candidates = 15 # how many to read content for (most recent first)
-top_results = 5          # how many ranked results to return
+max_candidates = 30          # files collected from mdfind + image index
+max_read_candidates = 15     # how many to read content for
+top_results = 5              # how many ranked results to return
+skip_dirs = ["~/dev_repo"]   # directory trees to exclude entirely
 ```
+
+**Filename matches always surface**: when your query implies a filename fragment (e.g. "NRIC"), seek runs a `kMDItemDisplayName` pass and puts those hits in a priority bucket that bypasses the recency sort — so an old-but-exact-name file isn't crowded out by recent unrelated activity.
 
 ### 4. Index your images (optional)
 
@@ -96,7 +109,7 @@ Pick a number to open the file, or `q` to quit.
 | Config `[llm]` section | `model = "gpt-4o-mini"` in config.toml |
 | Built-in default | `google/gemini-2.0-flash-lite-001` via OpenRouter |
 
-Override env vars: `SEEK_LLM_MODEL`, `SEEK_LLM_BASE_URL`, `SEEK_LLM_API_KEY_ENV`.
+Override env vars: `SEEK_LLM_MODEL`, `SEEK_LLM_BASE_URL`, `SEEK_LLM_API_KEY_ENV`. These apply only to `[llm]` (primary) — `[llm.fallback]` is untouched.
 
 ### Switching providers
 
@@ -116,33 +129,51 @@ api_key = "your-key"
 
 ---
 
-## Local inference (MLX, Apple Silicon)
+## Local inference (Rapid-MLX, Apple Silicon)
 
-Run inference fully on-device — no API key, no network, no per-search cost:
+Run inference on-device — no per-search cost, no network — with cloud as a safety net.
 
 ```bash
-make install-mlx    # adds mlx-lm to the existing venv
+make install-mlx
 ```
 
-Then edit `~/.config/seek/config.toml`:
+This installs [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX) (an OpenAI-compatible local server) into the existing venv and symlinks `~/.local/bin/rapid-mlx`.
+
+### Two ways to wire it up
+
+**Cloud-primary, local fallback** (the default config above): the local daemon is only spawned when OpenRouter errors out, returns malformed JSON, or shape-mismatches. Free safety net at the cost of an occasional ~6s cold boot.
+
+**Local-primary, cloud fallback**: swap the two sections — put Rapid-MLX in `[llm]` and OpenRouter in `[llm.fallback]`. Best for sustained offline use.
 
 ```toml
 [llm]
-provider = "mlx"
-model = "mlx-community/Qwen3-1.7B-4bit"
+base_url = "http://localhost:8000/v1"
+model = "default"
+local_model = "llama3-3b"      # ~1.9 GB, no thinking mode
+idle_timeout_seconds = 900     # daemon self-exits after N idle seconds
 ```
 
-The model (~1.1GB) is downloaded during `make install-mlx` into `~/.cache/huggingface/hub/`. To use a different model: `make install-mlx MLX_MODEL=mlx-community/Qwen3-4B-4bit`. Thinking mode is automatically disabled for fast, direct JSON output.
+The first query downloads the model (~1.9 GB) and boots the daemon (~6s cold, ~1s warm). A watchdog process self-terminates the daemon after `idle_timeout_seconds` (default 15 min) of inactivity. No API key needed — seek auto-injects a dummy `"local"` key for localhost endpoints.
 
-**Recommended models** (4-bit quantized, comfortable on 16GB Macs):
+### Server commands
 
-| Model | Size | Notes |
+```bash
+seek server start    # spawn the daemon explicitly (otherwise auto-spawned on demand)
+seek server stop     # kill the daemon
+seek server status   # show pid, port, last-used time
+```
+
+State files: `~/.local/share/seek/rapid-mlx.{pid,last_used,log}`.
+
+### Local model options
+
+| `local_model` | Size | Notes |
 |---|---|---|
-| `mlx-community/Qwen3-1.7B-4bit` | ~1.1GB | Recommended — best quality/size ratio |
-| `mlx-community/Qwen3-4B-4bit` | ~2.5GB | Better ranking quality, slower load |
-| `mlx-community/Qwen2.5-3B-Instruct-4bit` | ~2GB | Fallback if Qwen3 unavailable |
+| `llama3-3b` | ~1.9 GB | **Recommended** — empirical winner for this task |
+| `ministral-3b` | ~1.9 GB | Verbose JSON; can hit `max_tokens` on the rank step |
+| `phi4-14b` | ~8.5 GB | Higher quality, slower load, more RAM |
 
-To switch back to OpenRouter, remove the `provider` and `model` lines (or comment them out).
+`llama3-3b` is the default because `qwen3.5-4b`'s mandatory thinking mode (3072 tokens, 99s) blocked usage and `ministral-3b`'s verbosity truncated the rank step. Models live in Rapid-MLX's cache directory.
 
 ---
 
