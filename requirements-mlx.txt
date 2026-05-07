@@ -1,1 +1,1 @@
-mlx-lm>=0.20.0
+rapid-mlx

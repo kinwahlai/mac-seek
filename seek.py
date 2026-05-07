@@ -26,8 +26,29 @@ CONFIG_FILE = Path.home() / ".config/seek/config.toml"
 CAPTION_BINARY = Path(__file__).resolve().parent / "tools/caption/seek-caption"
 CAPTION_BATCH = 20
 
+SEEK_STATE_DIR = Path.home() / ".local/share/seek"
+RAPID_MLX_PID_FILE = SEEK_STATE_DIR / "rapid-mlx.pid"
+RAPID_MLX_LAST_USED = SEEK_STATE_DIR / "rapid-mlx.last_used"
+RAPID_MLX_LOG = SEEK_STATE_DIR / "rapid-mlx.log"
+RAPID_MLX_PORT_DEFAULT = 8000
+RAPID_MLX_DEFAULT_LOCAL_MODEL = "llama3-3b"  # Llama-3.2-3B-Instruct-4bit, ~1.9 GB, no thinking mode
+RAPID_MLX_IDLE_TIMEOUT_DEFAULT = 900  # 15 min
+RAPID_MLX_BOOT_TIMEOUT = 60  # max seconds to wait for server to come up
+
 DEFAULT_CONFIG = """\
+# Primary provider: local Rapid-MLX (Apple Silicon) — auto-spawned on first query.
+# Run `make install-mlx` first. To use cloud-only instead, replace this section
+# with the OpenRouter block from [llm.fallback] below.
 [llm]
+base_url = "http://localhost:8000/v1"
+model = "default"
+local_model = "llama3-3b"    # ~1.9 GB, no thinking mode. Alternatives: ministral-3b, gemma3-1b, phi4-14b
+idle_timeout_seconds = 900   # daemon self-exits after this many idle seconds
+
+# Backup provider: used when the local server can't start, errors out, or returns
+# malformed JSON. Set OPENROUTER_API_KEY (https://openrouter.ai/keys) in your env or
+# uncomment api_key below. Remove this section if you want local-only with no fallback.
+[llm.fallback]
 api_key_env = "OPENROUTER_API_KEY"
 base_url = "https://openrouter.ai/api/v1"
 model = "google/gemini-2.0-flash-lite-001"
@@ -36,10 +57,6 @@ fallback_models = [
   "openrouter/free",
   "nvidia/nemotron-3-super-120b-a12b:free",
 ]
-
-# To use local MLX inference instead (Apple Silicon only, requires `make install-mlx`):
-# provider = "mlx"
-# model = "mlx-community/Qwen3-1.7B-4bit"
 
 [index]
 folders = [
@@ -142,22 +159,30 @@ def _get_db() -> sqlite3.Connection | None:
         return None
 
 
-# ── LLM call with fallback ───────────────────────────────────────────────────
+# ── JSON extraction ──────────────────────────────────────────────────────────
 
-def _extract_json(text: str) -> str:
-    """Extract the first JSON object or array from text, stripping prose and fences."""
+def _extract_json(text: str, expected: str = "auto") -> str:
+    """Extract a JSON object/array from text. expected: 'object', 'array', or 'auto'."""
+    import re
+    text = text.strip()
+    # Strip <think>...</think> blocks (Qwen3, DeepSeek-R1, etc.) — even unclosed ones
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
     text = text.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text[3:]
         if text.endswith("```"):
             text = text[: text.rfind("```")]
         text = text.strip()
-    # Try whichever delimiter appears first in the text
     brace = text.find("{")
     bracket = text.find("[")
     if brace == -1 and bracket == -1:
         return text
-    if brace == -1 or (bracket != -1 and bracket < brace):
+    if expected == "object":
+        pairs = [("{", "}")]
+    elif expected == "array":
+        pairs = [("[", "]")]
+    elif brace == -1 or (bracket != -1 and bracket < brace):
         pairs = [("[", "]"), ("{", "}")]
     else:
         pairs = [("{", "}"), ("[", "]")]
@@ -176,61 +201,227 @@ def _extract_json(text: str) -> str:
     return text
 
 
-_mlx_cache: dict[str, tuple] = {}
+# ── Rapid-MLX server management ─────────────────────────────────────────────
+
+def _is_local_url(base_url: str) -> bool:
+    return "localhost" in base_url or "127.0.0.1" in base_url
 
 
-def _mlx_load(model_id: str) -> tuple:
-    if model_id not in _mlx_cache:
-        try:
-            from mlx_lm import load  # type: ignore
-        except ImportError:
-            print("Error: mlx-lm not installed. Run: make install-mlx", file=sys.stderr)
-            sys.exit(1)
-        print(f"  [loading mlx model {model_id}...]", file=sys.stderr)
-        _mlx_cache[model_id] = load(model_id)
-    return _mlx_cache[model_id]
-
-
-def _mlx_call(model_id: str, max_tokens: int, messages: list[dict]) -> str:
-    from mlx_lm import generate  # type: ignore
-    model, tokenizer = _mlx_load(model_id)
+def _port_from_url(base_url: str) -> int:
+    """Extract port from base_url, defaulting to RAPID_MLX_PORT_DEFAULT."""
     try:
-        # Qwen3 and compatible models: disable thinking mode for fast, direct JSON output
-        prompt = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False, enable_thinking=False
-        )
-    except TypeError:
-        prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    return generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False).strip()
+        from urllib.parse import urlparse
+        return urlparse(base_url).port or RAPID_MLX_PORT_DEFAULT
+    except Exception:
+        return RAPID_MLX_PORT_DEFAULT
 
 
-def _llm_call(
-    provider: str,
-    client: "OpenAI | None",
-    model: str,
-    fallback_models: list[str],
+def _server_pid() -> int | None:
+    """Return PID if the recorded server process is alive, else None (and clean stale file)."""
+    if not RAPID_MLX_PID_FILE.exists():
+        return None
+    try:
+        pid = int(RAPID_MLX_PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError, OSError):
+        try:
+            RAPID_MLX_PID_FILE.unlink()
+        except OSError:
+            pass
+        return None
+
+
+def _server_responds(port: int, timeout: float = 1.5) -> bool:
+    import urllib.request, urllib.error
+    try:
+        urllib.request.urlopen(f"http://localhost:{port}/v1/models", timeout=timeout)
+        return True
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+
+def _touch_last_used():
+    SEEK_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    RAPID_MLX_LAST_USED.write_text(str(time.time()))
+
+
+def _spawn_server(local_model: str, port: int, idle_timeout: int) -> int:
+    """Launch rapid-mlx detached + watchdog. Returns rapid-mlx PID."""
+    SEEK_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    log_fh = open(RAPID_MLX_LOG, "ab", buffering=0)
+    proc = subprocess.Popen(
+        ["rapid-mlx", "serve", local_model, "--port", str(port)],
+        stdin=subprocess.DEVNULL, stdout=log_fh, stderr=log_fh,
+        start_new_session=True,
+    )
+    RAPID_MLX_PID_FILE.write_text(str(proc.pid))
+    _touch_last_used()
+    # Spawn watchdog that polls last_used and kills server when idle expires
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "__watchdog",
+         str(proc.pid), str(idle_timeout)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return proc.pid
+
+
+def _wait_for_ready(port: int, timeout: float = RAPID_MLX_BOOT_TIMEOUT) -> bool:
+    """Poll the server until it responds or timeout elapses."""
+    start = time.time()
+    last_dot = 0.0
+    while time.time() - start < timeout:
+        if _server_responds(port, timeout=0.8):
+            return True
+        if time.time() - last_dot >= 1.0:
+            print(".", end="", file=sys.stderr, flush=True)
+            last_dot = time.time()
+        time.sleep(0.4)
+    return False
+
+
+def ensure_server(local_model: str, port: int, idle_timeout: int) -> bool:
+    """Make sure rapid-mlx is up. Returns True on success."""
+    if _server_pid() and _server_responds(port):
+        _touch_last_used()
+        return True
+    print(f"  Starting local model server ({local_model})", end="", file=sys.stderr, flush=True)
+    _spawn_server(local_model, port, idle_timeout)
+    ok = _wait_for_ready(port)
+    print("", file=sys.stderr)
+    if ok:
+        print("  Ready.", file=sys.stderr)
+    else:
+        print(f"  Server didn't respond within {RAPID_MLX_BOOT_TIMEOUT}s. Check {RAPID_MLX_LOG}", file=sys.stderr)
+    return ok
+
+
+def stop_server() -> bool:
+    pid = _server_pid()
+    if not pid:
+        print("  No server running.")
+        return False
+    try:
+        os.kill(pid, 15)  # SIGTERM
+        for _ in range(20):
+            time.sleep(0.2)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+        else:
+            os.kill(pid, 9)  # SIGKILL fallback
+    except ProcessLookupError:
+        pass
+    try:
+        RAPID_MLX_PID_FILE.unlink()
+    except OSError:
+        pass
+    print(f"  Stopped rapid-mlx (pid {pid}).")
+    return True
+
+
+def server_status(port: int):
+    pid = _server_pid()
+    if not pid:
+        print("  rapid-mlx: not running")
+        return
+    responding = _server_responds(port)
+    last_used = "unknown"
+    if RAPID_MLX_LAST_USED.exists():
+        try:
+            ago = time.time() - float(RAPID_MLX_LAST_USED.read_text().strip())
+            last_used = f"{ago:.0f}s ago"
+        except Exception:
+            pass
+    print(f"  rapid-mlx: running (pid {pid}, port {port}, responding={responding}, last_used {last_used})")
+
+
+def run_server_subcommand(args: list[str]):
+    if not args:
+        print("Usage: seek server <start|stop|status>")
+        sys.exit(1)
+    sub = args[0]
+    config = _load_config().get("llm", {})
+    base_url = config.get("base_url", "")
+    port = _port_from_url(base_url) if _is_local_url(base_url) else RAPID_MLX_PORT_DEFAULT
+    local_model = config.get("local_model", RAPID_MLX_DEFAULT_LOCAL_MODEL)
+    idle_timeout = int(config.get("idle_timeout_seconds", RAPID_MLX_IDLE_TIMEOUT_DEFAULT))
+    if sub == "start":
+        ensure_server(local_model, port, idle_timeout)
+    elif sub == "stop":
+        stop_server()
+    elif sub == "status":
+        server_status(port)
+    else:
+        print(f"Unknown subcommand: {sub}. Use start, stop, or status.")
+        sys.exit(1)
+
+
+def run_watchdog(rapid_pid: int, idle_timeout: int):
+    """Background process: kill rapid-mlx after idle_timeout seconds without activity."""
+    while True:
+        try:
+            os.kill(rapid_pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return  # server died on its own
+        try:
+            last = float(RAPID_MLX_LAST_USED.read_text().strip())
+        except (OSError, ValueError):
+            last = time.time()
+        if time.time() - last > idle_timeout:
+            try:
+                os.kill(rapid_pid, 15)
+            except ProcessLookupError:
+                pass
+            try:
+                RAPID_MLX_PID_FILE.unlink()
+            except OSError:
+                pass
+            return
+        time.sleep(min(60, max(10, idle_timeout // 5)))
+
+
+# ── LLM call with fallback ───────────────────────────────────────────────────
+
+def _llm_call_json(
+    providers: list[dict],
     max_tokens: int,
     messages: list[dict],
-) -> str:
-    if provider == "mlx":
-        try:
-            return _mlx_call(model, max_tokens, messages)
-        except Exception as e:
-            raise RuntimeError(f"MLX inference failed: {e}") from e
+    expected: str,
+):
+    """Walk providers in order, calling each with its model+fallback_models, until one
+    returns text that parses as JSON of the expected shape ('object' or 'array').
+    Provider-level fallback (e.g. local → openrouter) covers HTTP errors, parse errors,
+    and shape mismatches alike."""
+    extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
     last_err: Exception | None = None
-    for m in [model] + fallback_models:
-        try:
-            resp = client.chat.completions.create(model=m, max_tokens=max_tokens, messages=messages)  # type: ignore
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            last_err = e
-            print(f"  [model {m} failed ({type(e).__name__}), trying fallback]", file=sys.stderr)
+    for p in providers:
+        for m in [p["model"]] + p["fallback_models"]:
+            try:
+                resp = p["client"].chat.completions.create(
+                    model=m, max_tokens=max_tokens, messages=messages, extra_body=extra_body,
+                )
+                text = resp.choices[0].message.content.strip()
+                parsed = json.loads(_extract_json(text, expected=expected))
+                if expected == "object" and not isinstance(parsed, dict):
+                    raise ValueError(f"expected JSON object, got {type(parsed).__name__}")
+                if expected == "array" and not isinstance(parsed, list):
+                    raise ValueError(f"expected JSON array, got {type(parsed).__name__}")
+                return parsed
+            except Exception as e:
+                last_err = e
+                print(
+                    f"  [{p['name']}/{m} failed ({type(e).__name__}: {str(e)[:80]})]",
+                    file=sys.stderr,
+                )
     raise last_err
 
 
 # ── Query analysis ──────────────────────────────────────────────────────────
 
-def analyse_query(provider: str, client: "OpenAI | None", model: str, fallback_models: list[str], user_query: str) -> dict:
+def analyse_query(providers: list[dict], user_query: str) -> dict:
     prompt = f'''Analyse this file search query. The user is trying to find a file on their Mac.
 
 Query: "{user_query}"
@@ -255,8 +446,7 @@ Rules:
 - file_type_hint: infer from context. "notes I took" → document. "that script" → code. null if unclear.
 - context_summary: preserve the user's situational context — "notes taken during an info session", "a playbook prepared for someone", etc. This helps with ranking.'''
 
-    text = _llm_call(provider, client, model, fallback_models, 1024, [{"role": "user", "content": prompt}])
-    return json.loads(_extract_json(text))
+    return _llm_call_json(providers, 512, [{"role": "user", "content": prompt}], expected="object")
 
 
 # ── File discovery ──────────────────────────────────────────────────────────
@@ -449,10 +639,7 @@ def build_candidates_info(paths: list[str], db: sqlite3.Connection | None = None
 # ── LLM ranking ─────────────────────────────────────────────────────────────
 
 def rank_candidates(
-    provider: str,
-    client: "OpenAI | None",
-    model: str,
-    fallback_models: list[str],
+    providers: list[dict],
     user_query: str,
     context_summary: str,
     candidates: list[dict],
@@ -484,8 +671,7 @@ Return JSON only:
 Candidates:
 {candidates_json}'''
 
-    text = _llm_call(provider, client, model, fallback_models, 1024, [{"role": "user", "content": prompt}])
-    return json.loads(_extract_json(text))
+    return _llm_call_json(providers, 1024, [{"role": "user", "content": prompt}], expected="array")
 
 
 # ── Formatting helpers ───────────────────────────────────────────────────────
@@ -514,24 +700,65 @@ def _load_config() -> dict:
         return tomllib.load(f)
 
 
-def _load_llm_config() -> tuple[str, str, str, str, list[str]]:
-    """Return (provider, api_key, base_url, model, fallback_models). Env vars override config, config overrides defaults."""
+def _resolve_provider(name: str, section: dict, *, default_base_url: str, default_model: str) -> dict | None:
+    """Build a provider dict from a config section. Returns None if not configured / no key."""
+    if not section:
+        return None
+    base_url = section.get("base_url", default_base_url)
+    model = section.get("model", default_model)
+    api_key_env = section.get("api_key_env", "OPENROUTER_API_KEY")
+    api_key = os.environ.get(api_key_env) or section.get("api_key")
+    is_local = _is_local_url(base_url)
+    if not api_key:
+        if is_local:
+            api_key = "local"
+        else:
+            return None  # cloud provider with no key — silently skip
+    return {
+        "name": name,
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": model,
+        "fallback_models": section.get("fallback_models", []),
+        "is_local": is_local,
+        "port": _port_from_url(base_url),
+        "local_model": section.get("local_model", RAPID_MLX_DEFAULT_LOCAL_MODEL),
+        "idle_timeout": int(section.get("idle_timeout_seconds", RAPID_MLX_IDLE_TIMEOUT_DEFAULT)),
+    }
+
+
+def _load_llm_config() -> dict:
+    """Return {primary, fallback}. Env vars override [llm]. Fallback comes from [llm.fallback]."""
     config = _load_config()
     llm = config.get("llm", {})
-    provider = llm.get("provider", "openai")
-    model = os.environ.get("SEEK_LLM_MODEL", llm.get("model", "google/gemini-2.0-flash-exp:free"))
-    base_url = os.environ.get("SEEK_LLM_BASE_URL", llm.get("base_url", "https://openrouter.ai/api/v1"))
-    api_key_env = os.environ.get("SEEK_LLM_API_KEY_ENV", llm.get("api_key_env", "OPENROUTER_API_KEY"))
-    api_key = os.environ.get(api_key_env) or llm.get("api_key")
-    fallback_models = llm.get("fallback_models", ["meta-llama/llama-3.3-70b-instruct:free"])
-    if provider != "mlx" and not api_key:
+    fallback_section = llm.get("fallback") or {}
+    # Env-var overrides apply only to the primary provider
+    primary_section = {
+        **{k: v for k, v in llm.items() if k != "fallback"},
+        **{k: v for k, v in {
+            "model": os.environ.get("SEEK_LLM_MODEL"),
+            "base_url": os.environ.get("SEEK_LLM_BASE_URL"),
+            "api_key_env": os.environ.get("SEEK_LLM_API_KEY_ENV"),
+        }.items() if v},
+    }
+    primary = _resolve_provider(
+        "primary", primary_section,
+        default_base_url="https://openrouter.ai/api/v1",
+        default_model="google/gemini-2.0-flash-exp:free",
+    )
+    fallback = _resolve_provider(
+        "fallback", fallback_section,
+        default_base_url="https://openrouter.ai/api/v1",
+        default_model="google/gemini-2.0-flash-lite-001",
+    )
+    if not primary and not fallback:
         print(
-            f"Error: {api_key_env} environment variable not set.\n"
-            f"  Get a free key at https://openrouter.ai/keys",
+            "Error: no LLM provider configured. Set [llm] in ~/.config/seek/config.toml,\n"
+            "  or set OPENROUTER_API_KEY (https://openrouter.ai/keys).",
             file=sys.stderr,
         )
         sys.exit(1)
-    return provider, api_key, base_url, model, fallback_models
+    return {"primary": primary, "fallback": fallback}
 
 
 def _load_search_config() -> tuple[int, int, int]:
@@ -689,6 +916,14 @@ def main():
         run_index(args[1:])
         return
 
+    if args and args[0] == "server":
+        run_server_subcommand(args[1:])
+        return
+
+    if args and args[0] == "__watchdog" and len(args) == 3:
+        run_watchdog(int(args[1]), int(args[2]))
+        return
+
     json_mode = "--json" in args
     if json_mode:
         args.remove("--json")
@@ -696,23 +931,40 @@ def main():
     if not args:
         print("Usage: seek <natural language description>")
         print('       seek index [--rebuild] [--status]')
+        print('       seek server [start|stop|status]')
         print('Example: seek "the budget spreadsheet from the Q3 review"')
         sys.exit(1)
 
     user_query = " ".join(args)
 
-    provider, api_key, base_url, model, fallback_models = _load_llm_config()
+    cfg = _load_llm_config()
     max_candidates, max_read_candidates, top_results = _load_search_config()
 
     t0 = time.time()
     log = (lambda msg: print(msg, file=sys.stderr)) if json_mode else print
 
+    primary, fallback = cfg["primary"], cfg["fallback"]
+    if primary and primary["is_local"]:
+        if not ensure_server(primary["local_model"], primary["port"], primary["idle_timeout"]):
+            if fallback:
+                print("  Local server unavailable — falling back to cloud provider.", file=sys.stderr)
+                primary = None
+            else:
+                sys.exit(1)
+        else:
+            _touch_last_used()
+
+    providers = []
+    for p in (primary, fallback):
+        if p:
+            p["client"] = OpenAI(api_key=p["api_key"], base_url=p["base_url"])
+            providers.append(p)
+
     db = _get_db()
-    client = None if provider == "mlx" else OpenAI(api_key=api_key, base_url=base_url)
 
     log(f'Searching for: "{user_query}"')
     t1 = time.time()
-    analysis = analyse_query(provider, client, model, fallback_models, user_query)
+    analysis = analyse_query(providers, user_query)
     print(f"  [analyse: {time.time()-t1:.1f}s]", file=sys.stderr)
 
     keywords_display = " | ".join(
@@ -745,7 +997,7 @@ def main():
 
     context_summary = analysis.get("context_summary", user_query)
     t4 = time.time()
-    rankings = rank_candidates(provider, client, model, fallback_models, user_query, context_summary, candidates, top_results)
+    rankings = rank_candidates(providers, user_query, context_summary, candidates, top_results)
     print(f"  [rank: {time.time()-t4:.1f}s]", file=sys.stderr)
     print(f"  [total: {time.time()-t0:.1f}s]", file=sys.stderr)
 

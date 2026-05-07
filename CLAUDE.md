@@ -25,7 +25,7 @@ tools/caption/
   seek-caption.swift           # Vision OCR+classification captioner source
   seek-caption                 # Compiled binary (gitignored — build with swiftc below)
 requirements.txt               # Required: openai>=1.0
-requirements-mlx.txt           # Optional: mlx-lm>=0.20.0 (Apple Silicon local inference)
+requirements-mlx.txt           # Optional: rapid-mlx (Apple Silicon local inference server)
 .env                           # OPENROUTER_API_KEY (gitignored)
 semantic-file-search-spec.md   # Original project spec
 ```
@@ -58,14 +58,14 @@ seek index --status            # show row count and last indexed date
 
 ```bash
 make install            # Recommended: sets up venv, installs openai, builds caption helper, installs seek to PATH
-make install-mlx        # Optional: adds mlx-lm + downloads Qwen3-1.7B-4bit for local inference
+make install-mlx        # Optional: installs Rapid-MLX for local inference (Apple Silicon)
 brew install poppler pandoc  # Optional — for PDF/docx content extraction
 ```
 
 Manual install:
 ```bash
 pip install openai           # Required
-pip install mlx-lm           # Optional — Apple Silicon local inference only
+pip install rapid-mlx        # Optional — Apple Silicon local inference server
 cd tools/caption && swiftc -O seek-caption.swift -o seek-caption  # Optional — image captioning
 ```
 
@@ -73,14 +73,16 @@ cd tools/caption && swiftc -O seek-caption.swift -o seek-caption  # Optional —
 
 ## Key Technical Decisions
 
-- **LLM**: `google/gemini-2.0-flash-lite-001` via OpenRouter by default (`openai` SDK with custom `base_url`). Fast (~1s/call) and cheap. Get a key at https://openrouter.ai/keys
-- **Local inference**: Set `provider = "mlx"` and `model = "mlx-community/Qwen3-1.7B-4bit"` in `[llm]` config for fully on-device inference via `mlx-lm`. No API key needed. Thinking mode auto-disabled via `enable_thinking=False` in chat template. Falls back gracefully to standard `apply_chat_template` for non-Qwen3 models.
-- **API key**: `OPENROUTER_API_KEY` environment variable (stored in `.env`, gitignored). Skipped entirely when `provider = "mlx"`.
-- **LLM config override** (highest → lowest priority):
-  1. Env vars: `SEEK_LLM_MODEL`, `SEEK_LLM_BASE_URL`, `SEEK_LLM_API_KEY_ENV`
+- **LLM provider model**: two-tier — `[llm]` is **primary**, `[llm.fallback]` is **backup**. `_llm_call_json` walks providers in order; fallback fires on HTTP errors, JSON parse errors, OR shape mismatches (not just HTTP). Local primary auto-drops if `ensure_server` returns False (boot timeout) — only fallback is used in that case.
+- **Default primary — local Rapid-MLX**: [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX), an OpenAI-compatible server for Apple Silicon. `base_url = "http://localhost:8000/v1"`, `model = "default"`, `local_model = "llama3-3b"` (Llama-3.2-3B-Instruct-4bit, ~1.9 GB, no thinking mode). Seek **auto-spawns** the server as a detached daemon on first query (~6s cold), with a watchdog process that self-terminates the daemon after `idle_timeout_seconds` (default 900) of inactivity. Manual control: `seek server start|stop|status`. State files: `~/.local/share/seek/rapid-mlx.{pid,last_used,log}`. No API key — seek auto-injects a dummy `"local"` key when `base_url` is localhost. **Model history**: `qwen3.5-4b` was tried first but its mandatory thinking mode (3072 tokens, 99s) blocked usage; `ministral-3b` had verbose JSON that hit max_tokens and truncated. `llama3-3b` is the empirical winner for this task.
+- **Default fallback — OpenRouter**: `google/gemini-2.0-flash-lite-001` with free-tier fallback chain. Requires `OPENROUTER_API_KEY` env or `api_key` in `[llm.fallback]`. Used when local is unavailable.
+- **Thinking-model defense**: `_llm_call_json` always sends `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` (Qwen3-style switch). `_extract_json` also strips `<think>...</think>` blocks server-side servers don't honor the kwarg.
+- **API key**: `OPENROUTER_API_KEY` environment variable (or `api_key` in config). Auto-skipped for local servers. If a cloud provider has no key it's silently dropped from the providers list.
+- **Primary config override** (highest → lowest priority):
+  1. Env vars: `SEEK_LLM_MODEL`, `SEEK_LLM_BASE_URL`, `SEEK_LLM_API_KEY_ENV` (apply to `[llm]`, not `[llm.fallback]`)
   2. `[llm]` section in `~/.config/seek/config.toml`
-  3. Built-in defaults (OpenRouter + Gemini Flash free)
-- **Switching providers**: Set `provider = "mlx"` for local inference, or set `base_url`/`model`/`api_key_env` for any OpenAI-compatible endpoint
+  3. Built-in defaults (OpenRouter + Gemini Flash Lite)
+- **Switching providers**: Edit `[llm]` in config. Works with any OpenAI-compatible endpoint (Rapid-MLX, vLLM, llama.cpp server, OpenRouter, etc.). Drop `[llm.fallback]` entirely for single-provider setups.
 - **Search limits**: Configurable via `[search]` in `~/.config/seek/config.toml` — `max_candidates` (default 30), `max_read_candidates` (default 15), `top_results` (default 5). All candidates sorted by recency; images no longer front-loaded.
 - **JSON extraction**: `_extract_json()` helper robustly extracts the first JSON object/array from LLM output, stripping prose, fences, and thinking-mode preamble
 - **Path filtering**: Extensive `SKIP_PATTERNS` set (top-level constant, shared by both search and indexer) excludes macOS system dirs, caches, build artifacts, package managers, IDE files, and Python/Node/Rust caches to keep candidates relevant
