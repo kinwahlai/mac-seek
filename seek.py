@@ -21,6 +21,12 @@ MAX_FILE_SIZE = 5 * 1024 * 1024
 MDFIND_TIMEOUT = 5
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".gif", ".webp", ".tiff"}
+TYPE_EXTS: dict[str, set[str]] = {
+    "document":   {".pdf", ".docx", ".doc", ".txt", ".md", ".pages", ".odt", ".rtf"},
+    "spreadsheet": {".xlsx", ".xls", ".csv", ".numbers", ".ods"},
+    "image":      IMAGE_EXTS,
+    "code":       {".py", ".js", ".ts", ".swift", ".go", ".rb", ".java", ".c", ".cpp", ".h", ".rs", ".sh"},
+}
 INDEX_DB = Path.home() / ".local/share/seek/index.db"
 CONFIG_FILE = Path.home() / ".config/seek/config.toml"
 CAPTION_BINARY = Path(__file__).resolve().parent / "tools/caption/seek-caption"
@@ -36,19 +42,10 @@ RAPID_MLX_IDLE_TIMEOUT_DEFAULT = 900  # 15 min
 RAPID_MLX_BOOT_TIMEOUT = 60  # max seconds to wait for server to come up
 
 DEFAULT_CONFIG = """\
-# Primary provider: local Rapid-MLX (Apple Silicon) — auto-spawned on first query.
-# Run `make install-mlx` first. To use cloud-only instead, replace this section
-# with the OpenRouter block from [llm.fallback] below.
+# Primary provider: OpenRouter cloud inference (fast, free tier available).
+# Get a key at https://openrouter.ai/keys and set OPENROUTER_API_KEY in your env,
+# or paste the key as api_key below.
 [llm]
-base_url = "http://localhost:8000/v1"
-model = "default"
-local_model = "llama3-3b"    # ~1.9 GB, no thinking mode. Alternatives: ministral-3b, gemma3-1b, phi4-14b
-idle_timeout_seconds = 900   # daemon self-exits after this many idle seconds
-
-# Backup provider: used when the local server can't start, errors out, or returns
-# malformed JSON. Set OPENROUTER_API_KEY (https://openrouter.ai/keys) in your env or
-# uncomment api_key below. Remove this section if you want local-only with no fallback.
-[llm.fallback]
 api_key_env = "OPENROUTER_API_KEY"
 base_url = "https://openrouter.ai/api/v1"
 model = "google/gemini-2.0-flash-lite-001"
@@ -57,6 +54,14 @@ fallback_models = [
   "openrouter/free",
   "nvidia/nemotron-3-super-120b-a12b:free",
 ]
+
+# Optional: local Rapid-MLX fallback (Apple Silicon). Run `make install-mlx` first.
+# seek auto-spawns the server when this fallback is triggered.
+[llm.fallback]
+base_url = "http://localhost:8000/v1"
+model = "default"
+local_model = "llama3-3b"    # ~1.9 GB, no thinking mode. Alternatives: ministral-3b, phi4-14b
+idle_timeout_seconds = 900   # daemon self-exits after this many idle seconds
 
 [index]
 folders = [
@@ -70,6 +75,7 @@ max_image_bytes = 20_000_000
 max_candidates = 30      # total candidates collected from mdfind + image index
 max_read_candidates = 15 # how many files to read content for (most recent first)
 top_results = 5          # how many ranked results to return
+skip_dirs = ["~/dev_repo"]   # directory trees to exclude entirely from search results
 """
 
 SKIP_PATTERNS = {
@@ -468,35 +474,36 @@ def run_mdfind(query: str) -> list[str]:
         return []
 
 
-def search_candidates(analysis: dict, db: sqlite3.Connection | None = None, max_candidates: int = MAX_CANDIDATES) -> list[str]:
+def search_candidates(
+    analysis: dict,
+    db: sqlite3.Connection | None = None,
+    max_candidates: int = MAX_CANDIDATES,
+    skip_dirs: list[str] | None = None,
+) -> list[str]:
+    if skip_dirs is None:
+        skip_dirs = []
     seen: set[str] = set()
-    mdfind_results: list[str] = []
-    image_hits: list[str] = []
+    fn_hits: list[str] = []       # filename-fragment matches — always surfaced
+    image_hits: list[str] = []    # SQLite FTS image caption matches
+    kw_hits: list[str] = []       # keyword / date mdfind results
 
     def _valid(p: str) -> bool:
         return (p not in seen
                 and not any(s in p for s in SKIP_PATTERNS)
+                and not any(p.startswith(sd) for sd in skip_dirs)
                 and os.path.isfile(p))
 
-    def add_mdfind(paths: list[str]):
+    def _add(bucket: list[str], paths: list[str]):
         for p in paths:
             if _valid(p):
                 seen.add(p)
-                mdfind_results.append(p)
-
-    def add_image(paths: list[str]):
-        for p in paths:
-            if _valid(p):
-                seen.add(p)
-                image_hits.append(p)
+                bucket.append(p)
 
     keyword_sets = analysis.get("keyword_sets", [])
+    filename_fragments = analysis.get("filename_fragments", [])
 
-    queries = []
-    for kw_set in keyword_sets:
-        queries.append(" ".join(kw_set))
-    for frag in analysis.get("filename_fragments", []):
-        queries.append(f"kMDItemDisplayName == '*{frag}*'cd")
+    kw_queries = [" ".join(ks) for ks in keyword_sets]
+    fn_queries = [f"kMDItemDisplayName == '*{frag}*'cd" for frag in filename_fragments]
 
     date_hint = analysis.get("date_hint")
     if date_hint and keyword_sets:
@@ -513,15 +520,14 @@ def search_candidates(analysis: dict, db: sqlite3.Connection | None = None, max_
             else:
                 start_date = f"{date_hint}-01-01"
                 end_date = f"{int(date_hint) + 1}-01-01"
-            queries.append(
+            kw_queries.append(
                 f"{main_keyword} && "
                 f"kMDItemContentModificationDate >= $time.iso({start_date}) && "
                 f"kMDItemContentModificationDate < $time.iso({end_date})"
             )
 
-    # Image index hits first — so they're guaranteed a slot at the front of the read window
+    all_queries = kw_queries + fn_queries
     if db is not None:
-        # Use keyword_sets (concise, LLM-extracted) rather than verbose context_summary
         fts_terms = list(dict.fromkeys(
             w for ks in keyword_sets for w in ks if len(w) >= 2
         ))
@@ -532,19 +538,38 @@ def search_candidates(analysis: dict, db: sqlite3.Connection | None = None, max_
                     "SELECT path FROM images_fts WHERE images_fts MATCH ? ORDER BY rank LIMIT 15",
                     (fts_query,),
                 ).fetchall()
-                add_image([row[0] for row in rows])
+                _add(image_hits, [row[0] for row in rows])
             except Exception:
                 pass
 
-    with ThreadPoolExecutor(max_workers=len(queries) or 1) as pool:
-        futures = [pool.submit(run_mdfind, q) for q in queries]
-        for f in futures:
-            add_mdfind(f.result())
+    with ThreadPoolExecutor(max_workers=len(all_queries) or 1) as pool:
+        kw_futures = [pool.submit(run_mdfind, q) for q in kw_queries]
+        fn_futures = [pool.submit(run_mdfind, q) for q in fn_queries]
+        for f in fn_futures:
+            _add(fn_hits, f.result())
+        for f in kw_futures:
+            _add(kw_hits, f.result())
 
-    # Merge all sources and sort by recency so images don't crowd out text/PDFs
-    combined = list(dict.fromkeys(image_hits + mdfind_results))
-    combined.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return combined[:max_candidates]
+    file_type_hint = analysis.get("file_type_hint")
+    is_visual = file_type_hint == "image"
+
+    # fn_hits and image_hits bypass recency sort — they're always surfaced first
+    kw_sorted = sorted(kw_hits, key=lambda p: os.path.getmtime(p), reverse=True)
+
+    if is_visual:
+        combined = image_hits + fn_hits + kw_sorted
+    else:
+        combined = fn_hits + image_hits + kw_sorted
+        # Within the bulk, surface files matching the hinted type first
+        if file_type_hint and file_type_hint in TYPE_EXTS:
+            target_exts = TYPE_EXTS[file_type_hint]
+            priority = fn_hits  # already in front, keep order
+            bulk = image_hits + kw_sorted
+            bulk_matched = [p for p in bulk if Path(p).suffix.lower() in target_exts]
+            bulk_others = [p for p in bulk if Path(p).suffix.lower() not in target_exts]
+            combined = list(dict.fromkeys(priority + bulk_matched + bulk_others))
+
+    return list(dict.fromkeys(combined))[:max_candidates]
 
 
 # ── Content reading ─────────────────────────────────────────────────────────
@@ -775,13 +800,16 @@ def _load_llm_config() -> dict:
     return {"primary": primary, "fallback": fallback}
 
 
-def _load_search_config() -> tuple[int, int, int]:
-    """Return (max_candidates, max_read_candidates, top_results)."""
+def _load_search_config() -> tuple[int, int, int, list[str]]:
+    """Return (max_candidates, max_read_candidates, top_results, skip_dirs)."""
     s = _load_config().get("search", {})
+    raw_dirs = s.get("skip_dirs", ["~/dev_repo"])
+    skip_dirs = [str(Path(d).expanduser()) for d in raw_dirs]
     return (
         int(s.get("max_candidates", MAX_CANDIDATES)),
         int(s.get("max_read_candidates", MAX_READ_CANDIDATES)),
         int(s.get("top_results", MAX_TOP_RESULTS)),
+        skip_dirs,
     )
 
 
@@ -952,7 +980,7 @@ def main():
     user_query = " ".join(args)
 
     cfg = _load_llm_config()
-    max_candidates, max_read_candidates, top_results = _load_search_config()
+    max_candidates, max_read_candidates, top_results, skip_dirs = _load_search_config()
 
     t0 = time.time()
     log = (lambda msg: print(msg, file=sys.stderr)) if json_mode else print
@@ -990,7 +1018,7 @@ def main():
     log(f"Keywords: {keywords_display}")
 
     t2 = time.time()
-    paths = search_candidates(analysis, db, max_candidates)
+    paths = search_candidates(analysis, db, max_candidates, skip_dirs)
     print(f"  [mdfind+index: {time.time()-t2:.1f}s]", file=sys.stderr)
     if not paths:
         log("\nNo files found. Try different search terms.")
