@@ -426,25 +426,31 @@ def analyse_query(providers: list[dict], user_query: str) -> dict:
 
 Query: "{user_query}"
 
-Return JSON only, no explanation:
+Return JSON only with this shape:
 {{
-  "keyword_sets": [
-    ["most", "specific", "terms"],
-    ["broader", "terms"],
-    ["single_key_noun"]
-  ],
-  "filename_fragments": ["meeting", "notes"],
-  "date_hint": "2025-03" or null,
-  "file_type_hint": "document" or "code" or "spreadsheet" or null,
-  "context_summary": "One sentence describing what the user is actually looking for, including situational context"
+  "keyword_sets": [[<specific terms>], [<broader terms>], [<single noun>]],
+  "filename_fragments": [<lowercase substrings, or empty list>],
+  "date_hint": <"YYYY-MM" or "YYYY" or null>,
+  "file_type_hint": <"document" or "code" or "spreadsheet" or "image" or null>,
+  "context_summary": <one sentence describing what the user is looking for>
+}}
+
+Worked example — for the UNRELATED query "the slides Anjali made for the all-hands last March":
+{{
+  "keyword_sets": [["Anjali", "all-hands", "slides"], ["all-hands", "presentation"], ["slides"]],
+  "filename_fragments": ["all-hands", "slides", "anjali"],
+  "date_hint": "2026-03",
+  "file_type_hint": "document",
+  "context_summary": "A slide deck Anjali prepared for an all-hands gathering in March."
 }}
 
 Rules:
-- keyword_sets: 2-4 sets, from most specific to broadest. Include proper nouns, acronyms, technical terms.
-- filename_fragments: likely substrings in the filename (lowercase). Can be empty.
-- date_hint: if the user mentions a time period, convert to YYYY-MM or YYYY format. null if no time reference.
-- file_type_hint: infer from context. "notes I took" → document. "that script" → code. null if unclear.
-- context_summary: preserve the user's situational context — "notes taken during an info session", "a playbook prepared for someone", etc. This helps with ranking.'''
+- Derive every value from the user's query above. Do NOT reuse any strings from the example.
+- keyword_sets: 2-4 sets, most specific first. Include proper nouns, acronyms, technical terms.
+- filename_fragments: lowercase substrings likely to appear in the filename. Empty list if unclear.
+- date_hint: only when a time period is mentioned, otherwise null.
+- file_type_hint: infer from query language; null if unclear.
+- context_summary: preserve the user's situational framing.'''
 
     return _llm_call_json(providers, 512, [{"role": "user", "content": prompt}], expected="object")
 
@@ -651,22 +657,30 @@ def rank_candidates(
 Their description: "{user_query}"
 Context: {context_summary}
 
-Below are candidate files found on their machine. Rank the top {top_results} by how likely each is to be the file the user is describing.
+Below are candidate files. Rank the top {top_results} by how likely each is the file the user wants.
 
 Consider:
-- Content match: does the file content match what the user describes?
-- Context match: does the file look like the TYPE of document the user describes (e.g. notes, playbook, script)?
-- Recency: if the user implies a time period, prefer files from that period
-- Path clues: folder names can indicate project or context
+- Content match: does the file's content match the user's description?
+- Type match: does the filetype match what the user implied?
+- Recency: prefer files from the implied time period
+- Path clues: folder names hint at project or context
 
-Return JSON only:
+Return JSON only with this shape:
 [
-  {{"rank": 1, "index": 0, "confidence": 95, "reason": "One-line explanation"}},
+  {{"rank": <int>, "index": <candidate index>, "confidence": <0-100>, "reason": <one sentence grounded in this specific file>}},
   ...
 ]
 
-- confidence: 0-100 how confident this is the file the user wants. 90+ = almost certain, 70-89 = likely, 50-69 = possible, below 50 = weak match.
-- If fewer than {top_results} candidates seem relevant, return only the relevant ones. Omit weak matches (confidence < 30).
+Worked example — UNRELATED query "the budget spreadsheet Priya emailed me last week":
+[
+  {{"rank": 1, "index": 4, "confidence": 92, "reason": "Excel file in /Inbox modified 3 days ago, content_preview shows 'Q3 budget' in row 1"}},
+  {{"rank": 2, "index": 0, "confidence": 65, "reason": "Same folder but modified 2 months ago — too old for 'last week'"}}
+]
+
+Rules:
+- Each reason must reference concrete evidence from the candidate's path, content_preview, or modified date. Do NOT reuse strings from the example.
+- confidence: 90+ almost certain, 70-89 likely, 50-69 possible, <50 weak.
+- If fewer than {top_results} candidates fit, return only the relevant ones. Omit confidence < 30.
 
 Candidates:
 {candidates_json}'''
